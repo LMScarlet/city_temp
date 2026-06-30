@@ -336,11 +336,16 @@ class CShxAnalysis:
                 if icon_month and str(icon_month) != condition:
                     continue
 
+                max_raw = icon.get("maxvalue")
+                min_raw = icon.get("minvalue")
+                yz_raw = icon.get("exponentialcomponent")
+
                 listA.append({
                     "element": str(icon.get("weatherfactor", "")),
-                    "max": float(icon.get("maxvalue", 0)),
-                    "min": float(icon.get("minvalue", 0)),
-                    "yz": float(icon.get("exponentialcomponent", 0))
+                    # 拦截 None 和空字符串，赋予极限值保障区间逻辑闭合
+                    "max": float(max_raw) if max_raw not in (None, "") else 9999.0,
+                    "min": float(min_raw) if min_raw not in (None, "") else -99.0,
+                    "yz": float(yz_raw) if yz_raw not in (None, "") else 0.0
                 })
         except Exception:
             pass
@@ -395,7 +400,7 @@ class CShxAnalysis:
             dmCutPart = Se_Part()
             areawork.GetObjPos(0, dmCutPart)
 
-            # 1. 得到在城区内的预报站点信息 township_forecast_province（wlmqC++那边调的是省台乡镇预报，后续根据玉林数据采集情况或许得改）
+            # 1. 得到在城区内的预报站点信息 township_forecast_province（wlmqC++那边调的是省台乡镇预报，但玉林这边没给它入库，直接用乡镇预报表）
             cols_fcst = [
                 "stationid", "stationname", "longitude", "latitude",
                 "min(COALESCE(CAST(NULLIF(TRIM(CAST(humid AS text)), '') AS numeric), 0)) as humid",
@@ -404,7 +409,7 @@ class CShxAnalysis:
                 "sum(COALESCE(CAST(NULLIF(TRIM(CAST(rain AS text)), '') AS numeric), 0)) as rain"
             ]
             param_fcst = f"dateChar='{date_str}' and timechar='{sc}' and ntimes<=24 "
-            fcst_data = DataServiceOperate.http_request_post(self.myDB.qx_url, "township_forecast_province",
+            fcst_data = DataServiceOperate.http_request_post(self.myDB.qx_url, "township_forecast",
                                                              "select", param_fcst, columns=cols_fcst)
 
             city_list = []
@@ -771,7 +776,7 @@ if __name__ == "__main__":
         test_json = {
             "className": "model",
             "methodName": "cshx",
-            "postdata": "gxyulin|2024-09-27 20:00:00|20"
+            "postdata": "gxyulin|2026-06-11 08:00:00|08"
         }
         result = runService(
             className=test_json["className"],
