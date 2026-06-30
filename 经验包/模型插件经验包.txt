@@ -1,0 +1,740 @@
+人类最高指令：
+因为转写插件时你们AI经常误解TEST_MODE的用途，我明确说一下，它是“调试模式”而非“测试模式”更不是“测试缓存路径”，因为模型插件在实际业务中是要被外部C++服务平台调用并实例化的，而这会影响到os.getcwd()的结果，但是被外部调用的话我就没办法断点调试问题，所以才专门弄了这个TEST_BASE_DIR及开关来让调试模式下的base_dir指向外部C++服务平台路径，从而确保路径拼接结果一致来让程序正常运行（因为我不能让模型插件直接放在服务平台的路径里）。所以你们不要误解它的用途去瞎搞。
+
+【DMGIS 短期与短临预警模型 Python 映射经验包】
+
+### 📌 [全局导入：模块级依赖清单]
+
+进行短临和短期模型转写时，头部必须包含且仅包含以下 DMGIS SDK 核心组件：
+
+```python
+from dmgis.common.dmsde import GridDataInfo, AInf, Rct, Dt
+from dmgis.common.Se_Part import Se_Part
+from dmgis.common.Se_Dtst import Se_Dtst
+from dmgis.dtm.Grid import Grid
+from dmgis.dtm.Tin import Tin
+from dmgis.work.DtmWorkShop import DtmWorkShop
+from dmgis.work.GraphWorkShop import GraphWorkShop
+from dmgis.work.VecWorkShop import VecWorkShop
+from dmgis.common.DmMapCom import DmMapCom
+
+```
+
+### 📌 [核心机制一：工作区与内存生命周期管线 (WorkShop 体系)]
+
+* **C++ 侧签名**:
+`SDHAND sdhand = SD_Create();`
+`short ai = SD_OpenGridWork(sdhand, path);`
+`WDHAND gridwork = SD_GetWorkByNo(sdhand, ai);`
+`SD_Delete(sdhand);`
+* **Python 侧映射**:
+```python
+dtmWorkShop = DtmWorkShop()
+ai = dtmWorkShop.OpenGridWork(path)
+if ai >= 0:
+    gridwork = dtmWorkShop.GetWorkByNo(ai)
+
+```
+
+* **排坑标记 (Marker)**:
+1. **句柄自动托管说明**：封装类（如 `Tin()`, `Grid()`）直接实例化的对象，Python 底层已经和工作区池类一样完美实现了垃圾回收。不需要去寻找并调用 `tin.delete()` 或 `grd_delete`，让 Python 自动释放即可。
+
+### 📌 [核心机制二：网格基准信息与遍历存取]
+
+* **C++ 侧签名**:
+`gridDataInfo info; WDG_GetGetGridInfo(gridwork, &info);`
+`double dval = WDG_GetValue(gridwork, i, j);`
+`WDG_SetValue(gridwork, i, j, val);`
+* **Python 侧映射**:
+```python
+info = GridDataInfo()
+gridwork.GetGridInfo(info)
+dval = gridwork.GetValue(row, col)
+gridwork.SetValue(row, col, dval)
+
+```
+
+* **排坑标记 (Marker)**:
+**命名纠偏与无效值**：C++ 源码中具有明显的拼写错误 `WDG_GetGetGridInfo`，在 Python 封装层中一样也是GetGetGridInfo，虽然Python这边其实还多了一个GetGridInfo，但实测该接口存在无法正常返回zMax与zMin的重大危害问题，所以禁止使用，必须一律调用GetGetGridInfo！遍历取值时，必须手动判断 `dval == 9999.0`（预报缺测）或 `dval == -99999.0`（分析场缺测），并在计算前进行阻断或赋零。
+
+### 📌 [核心机制三：三角网 (TIN) 构建与重剖分]
+
+* **C++ 侧签名**:
+`HDTIN ybcontour = tin_create();`
+`tin_addpoint(ybcontour, dx, dy, dval);`
+`tin_calculate4pintzvalue(ybcontour, &rct);`
+`tin_dmmesh(ybcontour);`
+* **Python 侧映射**:
+```python
+ybcontour = Tin()
+ybcontour.addpoint(dx, dy, dval)
+ybcontour.calculate4pintzvalue(rct)
+ybcontour.dmmesh()
+
+```
+
+* **排坑标记 (Marker)**:
+`rct` (Rct 矩形对象) 的边界必须由基础网格的 `info.xMin / xMax` 向外扩充至少 2 个分辨率单位（`2 * dx`, `2 * dy`），否则三角网边缘会产生收敛撕裂。
+
+### 📌 [核心机制四：预警因子叠加算子辨析 (重中之重)]
+
+* **C++ 侧签名**:
+`grd_addgrid(gridAnaly, baseGrid, 1, dzyz);`
+`grd_addcontour(gridAnaly, skcontour, 1, skyz);`
+* **Python 侧映射**:
+```python
+grd = Grid()
+grd.setgridwork(analyseGrid)  # 挂载分析底图
+grd.clearallcontour()
+
+grd.addgrid(baseGrid, 1, dzyz)      # 直接网格叠加 (多用于基础地质场)
+grd.addcontour(ybcontour, 1, ybyz)  # TIN插值叠加 (绝对适用于实况与预报场)
+
+```
+
+* **排坑标记 (Marker)**:
+**算法隔离带**：`addgrid` 只能接受 `GetWorkByNo` 出来的 `DtmGridWork` 对象；`addcontour` 只能接受经过 `dmmesh` 的 `Tin` 对象。在处理气象观测/预报因子时，必须提取像元生成 `Tin` 并调用 `addcontour`，严禁图省事直接 `addgrid` 预报网格文件。
+
+### 📌 [核心机制五：等值面追踪与矢量对象解构]
+
+* **C++ 侧签名**:
+`grd_tracefillsign(gridAnaly, count, pset, pclr, yjhand);`
+`WG_GetObjInf(yjhand, m, &ainf);`
+`WGO_GetObjPos(wgobj, dtst);`
+* **Python 侧映射**:
+```python
+# pset 和 pclr 直接传入标准的 Python List 即可
+grd.tracefillsign(len(pset), pset, pclr, yjhand)
+
+# 获取追踪出的多边形数量并解构
+num = yjhand.GetObjNum()
+for m in range(num):
+    ainf = AInf()
+    yjhand.GetObjInf(m, ainf)
+    wgobj = yjhand.GetObj(m)
+
+    dtst = Se_Dtst()
+    wgobj.GetObjPos(dtst)
+    pt_list = dtst.toList() # 核心：将坐标集转化为可迭代列表
+
+```
+
+### 📌 [核心机制六：空间拓扑判定 (更新网格专用)]
+
+* **C++ 侧签名**:
+`dm_ptinpolygons1(&dt, &part)`
+* **Python 侧映射**:
+```python
+dmCom = DmMapCom()
+# 判断点 dt 是否在多边形 part 内部，返回值 > 0 表示在内部
+if dmCom.ptinpolygons1(dt, part) > 0:
+    pass
+
+```
+
+* **排坑标记 (Marker)**:
+用于用户在前台圈选多边形并强制修改网格极值的功能（`UpdateWarningGird`）。在双层 for 循环执行像素级判定时，必须先计算出 `part` (选区多边形) 的最小外包矩形，圈定 `startcol` 到 `endcol`，只对外包矩形内的像元执行 `ptinpolygons1` 拓扑判定，严禁全图遍历，否则会导致 API 请求响应严重超时。
+
+【经验包收录尾】
+
+【DMGIS 城市内涝模型 Python 映射经验包】
+
+📌 [修正版] 核心机制一：矢量属性表结构修改与字段扩充
+
+* **C++ 侧签名**:
+
+```cpp
+_field fld;
+strcpy(fld.szName,"NAME");
+fld.chType= MD_Char; fld.nLen=20; fld.nDec=0;
+DG_ModifyTable(rst);
+DG_AddField(rst, &fld);
+DG_UpdateTable(rst);
+
+```
+
+* **Python 侧映射**:
+
+```python
+# 必须引入 Field 结构体
+from dmgis.common.dmsde import Field
+
+rst = pntwork.GetRecordSet()
+rst.ModifyTable()
+
+fld = Field()
+fld.szName = "NAME"
+# 类型常量映射: 1 对应 MD_Char, 2 对应 MD_Numeric
+fld.chType = 1 
+fld.nLen = 20
+fld.nDec = 0
+
+rst.AddField(fld)
+rst.UpdateTable()
+
+```
+
+* **排坑标记 (Marker)**:
+
+1. 字符串编码红利：在对 Field 的 szName 赋值时，请放心大胆地使用 Python 的原生字符串 (str)。底层 SDK 已经拦截了赋值操作并自动转换为 C++ 需要的 GBK bytes。无需手动 .encode() 或加 b"" 前缀。
+2. **类型宏映射**：C++ 源码中的 `MD_Char` 和 `MD_Numeric` 宏并未暴露给 Python，在 Python 侧必须硬编码使用数字 `1` 代表字符型，`2` 代表数值型。
+
+### 📌 [核心机制二：矢量记录集 (RecordSet) 的读写编辑管线]
+
+* **C++ 侧签名**:
+
+```cpp
+// 读操作
+char *val = NULL;
+short num = DG_GetFieldValueByString(rset,"NAME",val,99);
+// 写操作
+DG_Edit(rst);
+DG_SetFieldValueByString(rst,"NAME",str);
+BOOL flag = DG_UpdateData(rst);
+
+```
+
+* **Python 侧映射**:
+
+```python
+# 读操作 (直接返回字符串，无需像 C++ 那样预分配内存)
+str_name = rset.GetFieldValueByString("NAME", 99).strip()
+d_val = rset.GetFieldValueByDouble("排水量m3")
+
+# 写操作 (必须严格遵守 Edit -> Set -> Update 流程)
+rst.Edit()
+rst.SetFieldValueByString("NAME", str_name)
+rst.UpdateData()
+
+```
+
+* **排坑标记 (Marker)**:
+进行任何 `SetFieldValue` 操作前，**必须先调用 `rst.Edit()` 开启编辑状态**；所有字段赋值完成后，**必须调用 `rst.UpdateData()` 提交修改**。如果漏掉其中任何一步，底层的修改将全部丢失，且不会产生任何报错。
+
+### 📌 [核心机制三：复杂多边形 (Se_Part/MultiPolygon) 的坐标集解构]
+
+* **C++ 侧签名**:
+
+```cpp
+int partsize = se_partgetpartsize(part);
+for(int kk = 0; kk < partsize; kk++) {
+    se_dtst* dst = se_partgetdtst(part, kk);
+    // ... 遍历 dst 中的点 ...
+}
+
+```
+
+* **Python 侧映射**:
+
+```python
+# Se_Part 代表多部分几何体，可能包含多个外环或镂空的洞
+partsize = part.GetPartSize()
+for kk in range(partsize):
+    # 将 Se_Part 拆解为单一的点集线环 Se_Dtst
+    dtst = part.GetDtst(kk)
+    # Se_Dtst 才拥有 toList() 语法糖
+    pts = dtst.toList() 
+    for p in pts:
+        pass # 处理 p.x 和 p.y
+
+```
+
+* **排坑标记 (Marker)**: **高危 API 调用雷区**！Python SDK 仅为 `Se_Dtst` (单一点集/线环) 封装了 `.toList()` 方法，而 `Se_Part` (多边形大类) **没有**此方法。在处理如“内涝区.sda”这种可能包含分离部件的图层时，严禁直接调用 `part.toList()`，必须老老实实按 C++ 的逻辑先 `GetPartSize()` 循环取出底层的 `Se_Dtst`，再调用 `.toList()` 提取坐标，否则会触发致命的 `AttributeError`。
+
+### 📌 [核心机制四：空间矩形框选与 ID 索引集 (Se_List) 解析]
+
+* **C++ 侧签名**:
+
+```cpp
+se_list *indexset = se_listcreate();
+WVP_RectSel1(pntwork, &rct, indexset);
+for (int iI = 0; iI < se_listgetsize(indexset); iI++) {
+    int index = (int)se_listgetpos(indexset, iI);
+    DG_SetPosIndex(rset, index);
+}
+
+```
+
+* **Python 侧映射**:
+
+```python
+from dmgis.common.Se_List import Se_List
+
+indexset = Se_List()
+# 执行空间矩形选择，将命中的要素 ID 存入 indexset
+pntwork.RectSel1(rct, indexset)
+
+# 直接调用 toList 展开为 Python 数组
+lst_list = indexset.toList()
+for index in lst_list:
+    rset.SetPosIndex(index)
+
+```
+
+* **排坑标记 (Marker)**:
+C++ 中繁琐的 `se_listgetsize` 和 `se_listgetpos` 遍历可以直接摒弃。Python SDK 已经为 `Se_List` 封装了扁平化的 `.toList()` 方法，直接调用即可返回所有选中要素的整数 ID 列表。
+
+### 📌 [核心机制五：网格底图无效值重置 (初始化清洗)]
+
+* **C++ 侧签名**:
+`WDG_ClearEffective(AnalyGrid,0);`
+或 `WDG_ClearEffective(analyseGrid,1);`
+* **Python 侧映射**:
+
+```python
+# 0 通常代表初始积水深度，1 通常代表初始径流系数
+AnalyGrid.ClearEffective(0)
+
+```
+
+* **排坑标记 (Marker)**:
+在执行类似于内涝积水推演、径流系数计算等**非累加类**的空间矩阵运算前，必须先调用 `ClearEffective(初始化数值)` 将整个网格的底图全部洗掉。如果不执行此步直接 `SetValue`，上一次计算残留的脏数据（或底图的 -99999 无效值）将直接参与拓扑渗透运算，导致生成的灾区极度扩大或扭曲。
+
+### 📌 [核心机制六：面与面空间相交判定]
+
+* **C++ 侧签名**:
+`dm_polygonsandpolygons1(dmCutPart, dmPart) < 1`
+* **Python 侧映射**:
+
+```python
+# dmCom 需提前实例化 DmMapCom()
+if self.dmMapCom.polygonsandpolygons1(dmCutPart, dmPart) < 1:
+    continue # 两个多边形不相交
+
+```
+
+* **参数与类型交接**: 传入的两个变量必须都是合法的 `Se_Part` 实例。返回值 `< 1` 代表不相交（游离在外部），`>= 1` 代表有交集。这通常在更新径流系数时，用于粗略过滤掉不在城区范围内的水系或绿地多边形，提高计算效率。
+
+【经验包收录尾】
+
+【DMGIS 森林火险与等值面追踪 Python 映射经验包】
+
+### 📌 [核心机制一：标绘与矢量工作区 (Graph/Vec WorkShop) 映射与生命周期]
+
+* **C++ 侧签名**:
+`SGHAND sghand = SG_Create(); ai = SG_CreateGraphWork(sghand); WGHAND yjhand = SG_GetWorkByNo(sghand,ai);`
+`SVHAND svhand = SV_Create(); ai = SV_CreateAreaWork(svhand, path); WVHAND areawork = SV_GetWorkByNo(svhand, ai);`
+* **Python 侧映射**:
+
+```python
+# 必须的绝对引入路径
+from dmgis.work.GraphWorkShop import GraphWorkShop
+from dmgis.work.VecWorkShop import VecWorkShop
+
+graphWorkShop = GraphWorkShop()
+ai_graph = graphWorkShop.CreateGraphWork()
+yjhand = graphWorkShop.GetWorkByNo(ai_graph)
+
+vecWorkShop = VecWorkShop()
+ai_area = vecWorkShop.CreateAreaWork(areapath)
+areawork = vecWorkShop.GetWorkByNo(ai_area)
+
+```
+
+* **排坑标记 (Marker)**:
+**同宗同源的内存泄漏红线**：`GraphWorkShop` 和 `VecWorkShop` 与 `DtmWorkShop` 属于同一级别的底层工厂类。必须在 `finally` 块中显式调用 `graphWorkShop.delete()` 和 `vecWorkShop.delete()`。
+另外，Python 端的 `CreateAreaWork` 或 `OpenAreaWork` 经常因为路径不存在或无权限返回 `-1`，必须做 `if ai_area >= 0:` 的拦截判定。
+
+### 📌 [核心机制二：等值面追踪 (tracefillsign) 参数透传]
+
+* **C++ 侧签名**:
+`double *pset = new double[yzVal.count()];`
+`_clr *pclr = new _clr[yzVal.count()];`
+`grd_tracefillsign(gridAnaly, yzVal.count(), pset, pclr, yjhand);`
+* **Python 侧映射**:
+
+```python
+# Python 端无需手动分配 C 数组，直接传原生 List
+pset = [v for v in self.yzVal]
+# clrVal 已经是整型的颜色值列表
+grd.tracefillsign(len(pset), pset, self.clrVal, yjhand)
+
+```
+
+* **排坑标记 (Marker)**:
+`tracefillsign` 方法是将网格数据转化为矢量面的桥梁。其最后一个接收结果的参数必须是 `WGHAND`（对应 Python 中的 `yjhand`，由 `GraphWorkShop` 生成），绝对不能直接传入 `VecWorkShop` 生成的 `areawork`。必须经历“先追踪到标绘层，再转存到矢量层”的两步走流程。
+
+### 📌 [核心机制三：从 Graph 实体解构到单点集 (Se_Dtst)]
+
+* **C++ 侧签名**:
+`WHOHAND wgobj = WG_GetObj(yjhand,m);`
+`se_dtst *dtst = se_dtstcreate();`
+`WGO_GetObjPos(wgobj,dtst);`
+`se_dtstfree(dtst);`
+* **Python 侧映射**:
+
+```python
+from dmgis.common.Se_Dtst import Se_Dtst
+
+# 从 Graph 工作区获取对象
+wgobj = yjhand.GetObj(m)
+dtst = Se_Dtst()
+# 提取该对象的空间坐标点集
+wgobj.GetObjPos(dtst)
+# 直接调用 toList 糖转化为 Python 坐标列表
+pt_list = dtst.toList()
+
+```
+
+* **排坑标记 (Marker)**:
+在 C++ 中 `WG_GetObjPos` 是全局方法，而在 Python SDK 中它被封装为了 `wgobj` 实例自身的方法（`wgobj.GetObjPos(dtst)`）。同样，Python 端实例化 `Se_Dtst` 后，无需像 C++ 那样手动调用 `se_dtstfree`。
+
+### 📌 [核心机制四：复杂多边形 (Se_Part) 的正向构建与写入]
+
+* **C++ 侧签名**:
+`se_part *part = se_partcreate();`
+`int* pPasrts = new int[1]{dtst->nPointNum};`
+`se_partsetsize(part,1,pPasrts);`
+`se_partsetpos(part, j, &dot);`
+`WVA_AddObj(areawork,part,&ainf);`
+* **Python 侧映射**:
+
+```python
+from dmgis.common.Se_Part import Se_Part
+
+part = Se_Part()
+# C++ 中繁琐的 new int[] 指针数组，在 Python 中直接传入 [节点数量] 即可
+part.SetSize([len(pt_list)])
+
+# 循环注入坐标点
+for i, pt in enumerate(pt_list):
+    part.SetPos(i, pt)
+
+# 将组装好的 Part 和属性信息 AInf 写入矢量工作区
+areawork.AddObj(part, ainf)
+
+```
+
+* **排坑标记 (Marker)**:
+**最容易崩溃的传参陷阱**：`part.SetSize()` 在 Python 端要求的参数是一个 **List**（代表多边形各部件的节点数），哪怕只有一个外环，也必须写成 `[len(pt_list)]`，绝对不能直接传整数 `len(pt_list)`，否则底层会因为解析不到数组指针而导致 `Segment Fault` 进程崩溃。
+
+### 📌 [核心机制五：属性结构体 (AInf) 的提取与判定]
+
+* **C++ 侧签名**:
+`_ainf ainf; memset(&ainf,0,sizeof(_ainf));`
+`WG_GetObjInf(yjhand, m, &ainf);`
+`if(clrVal[i] == ainf.col)`
+* **Python 侧映射**:
+
+```python
+from dmgis.common.dmsde import AInf
+
+ainf = AInf()
+yjhand.GetObjInf(m, ainf)
+
+# Python 端的 ainf.col 也是直接的十进制色值
+if self.clrVal[i] == ainf.col:
+    level = str(i)
+
+```
+
+* **排坑标记 (Marker)**:
+Python 实例化 `AInf` 时底层已经做好了初始化清理，无需 `memset`。在等值面追踪后，不同的阈值等级被映射到了不同的颜色上，因此无论是 C++ 还是 Python，都是通过比对 `ainf.col` (色值) 来反推该多边形属于哪个预警等级。
+
+【经验包收录尾】
+
+【DMGIS 城市火险模型 Python 映射补充经验包】
+
+### 📌 [核心机制一：既有矢量工作区 (SDA 文件) 的挂载与对象提取]
+
+* **C++ 侧签名**:
+`short cqno = SV_OpenAreaWork(m_hVWorkShop, workpath.toLocal8Bit().data());`
+`WVHAND areawork = SV_GetWorkByNo(m_hVWorkShop, cqno);`
+`se_part *dmCutPart = se_partcreate();`
+`WVA_GetObjPos(areawork, 0, dmCutPart);`
+* **Python 侧映射**:
+
+```python
+# 前提: vecWorkShop = VecWorkShop() 已实例化
+cqno = vecWorkShop.OpenAreaWork(workpath)
+if cqno >= 0:
+    areawork = vecWorkShop.GetWorkByNo(cqno)
+    
+    # 必须显式实例化空的容器
+    dmCutPart = Se_Part()
+    
+    # 提取图层中第 0 个实体（通常为城区/行政边界的主轮廓）的空间拓扑结构，回填给 dmCutPart
+    areawork.GetObjPos(0, dmCutPart)
+
+```
+
+* **排坑标记 (Marker)**:
+**逆向提取前置化**：在前面的等值面追踪中，我们使用 `CreateAreaWork` 结合 `part.SetPos` 去**组装并写入**多边形。而此处是**读取并提取**既有底图（如 `城区.sda`）用作拓扑约束（`ptinpolygons1`）。在 Python 中调用 `GetObjPos(对象索引, 目标容器)` 时，必须先实例化一个空的 `Se_Part()` 对象传入，由底层 C++ 库直接将内存中的顶点数据灌入这个空壳中，严禁尝试接收其返回值。
+
+### 📌 [核心机制二：矢量图元的外包矩形 (Bounding Box) 提取]
+
+* **C++ 侧签名**:
+`_rct rct;`
+`_initrect(rct);`
+`WVA_GetObjRect(areawork, 0, &rct);`
+* **Python 侧映射**:
+
+```python
+from dmgis.common.dmsde import Rct
+
+# 实例化 Rct() 时，底层会自动完成坐标极值的初始化（抹平了 C++ 中 _initrect 的需求）
+rct = Rct() 
+
+# 将空矩形框传入，底层会自动探测并回填实体（索引 0）的最大/最小经纬度
+areawork.GetObjRect(0, rct)
+
+```
+
+* **排坑标记 (Marker)**:
+在为 TIN 剖分（`calculate4pintzvalue`）约束边界，或为网格裁剪定位时，经常需要依赖目标区域的确切矩形。与提取多边形轮廓的 `GetObjPos` 原理一致，不要去拆解 `Se_Part` 手动计算最大最小值，直接调用 `GetObjRect(0, rct)` 让底层一次性吐出标准矩形即可，这在性能和精度上是唯一安全的做法。
+
+【经验包收录尾】
+
+### 【DMGIS 等值图模型 (Contour) Python 映射经验包】
+
+**📌 [核心机制一：高级等值线/面生成管线]**
+
+* **C++ 侧逻辑**:
+利用 `grd_addcontour1` 逐个压入不同级别的阈值与属性，随后执行 `grd_pushcontour`，接着进行平滑 (`grd_setsleek`)、生成 (`grd_producecontourline`) 和闭合处理 (`grd_contourhandling`)。
+* **Python 侧映射 (完全对应的原生 API)**:
+```python
+from dmgis.dtm.Grid import Grid
+
+# grid 为 dmgis.dtm.Grid 实例
+# 1. 压入等值线级别与对应的属性 (AInf/TInf)
+grid.addcontour1(level.value, level.areaInf)
+grid.addtextcontour(level.value, level.textInf)
+
+# 2. 执行核心渲染管线 (严格保证顺序)
+grid.pushcontour()                          # 压入准备
+grid.setsleek(param.size)                   # 等值线平滑
+grid.producecontourline(param.linetype, param.zls) # 生成等值线
+grid.contourhandling()                      # 等值线闭合与后处理
+
+```
+
+
+* **排坑标记 (Marker)**:
+调用上述管线前，`Grid` 实例必须已经通过 `grid.setgridwork(grid_work)` 挂载了物理网格数据。这套管线没有任何前缀，直接在 `Grid()` 实例上调用即可。
+
+**📌 [核心机制二：将网格直接切片为矢量工作区 (SDA/SDL/SDT)]**
+
+* **C++ 侧逻辑**:
+`int ai = grd_getareawork(gridAnaly1, strSaveFileName, vecWorkShop);`
+* **Python 侧映射**:
+```python
+# 必须传入目标保存路径和 VecWorkShop 工厂实例
+ai_area = grid.getareawork(work_path + ".sda", vec_shop)
+ai_line = grid.getlinework(work_path + ".sdl", vec_shop)
+ai_text = grid.gettextwork(work_path + ".sdt", vec_shop)
+
+if ai_area > -1:
+    areawork = vec_shop.GetWorkByNo(ai_area)
+    areawork.SaveWork(True) # 落盘保存
+
+```
+
+
+* **排坑标记 (Marker)**:
+Python 端的 `getareawork` 等方法内部已经封装了 `SV_CreateAreaWork` 的逻辑。只需要把 `vec_shop` 作为第二个参数传进去，底层会自动在工厂中创建一个工作区并返回其 ID (`ai_area`)，极大简化了 C++ 中的繁琐调用。
+
+**📌 [核心机制三：后处理绘图 (DrawByGraphics) 的 Pillow 降维重构标准]**
+
+* **架构演进说明**:
+针对在气象底图上叠加标题、站点文字、色块图例的需求，**绝对禁止**使用 `IS_Create()` 提取句柄并绑定 PyQt5 `QPainter` 的做法（极易引发内存段错误）。
+* **Python 标准打法 (基于 PIL/Pillow)**:
+参考 `dmgisplus_contour.py` 的实现方案，使用 `PIL.ImageDraw` 进行内存隔离的安全绘图：
+```python
+from PIL import Image, ImageDraw, ImageFont
+
+# 1. dmgis 底层 Mapmsi 生成基础底图后 (例如 temp.png)
+# 2. 使用纯 Python 的 Pillow 库重新加载图片
+img = Image.open("temp.png")
+draw = ImageDraw.Draw(img)
+font_legend = ImageFont.truetype("msyh.ttc", 10) # 挂载字体
+
+# 3. 使用标准 2D 绘图 API 绘制图例色块与文字 (安全且支持抗锯齿)
+# 例：绘制矩形图例
+draw.rectangle([x1, y1, x2, y2], fill=(r, g, b), outline=(0, 0, 0))
+# 例：绘制极限值多边形图例
+draw.polygon([(x1,y1), (x2,y2), (x3,y3)], fill=(r, g, b), outline=(0, 0, 0))
+# 例：绘制文字
+draw.text((x, y), "图例标题", fill=(0, 0, 0), font=font_legend)
+
+# 4. 保存并覆盖原图
+img.save("final_output.png", "PNG")
+img.close()
+
+```
+建议内容：虽然使用 Pillow 降维重构的战略是对的，但如果在模型插件中需要 DMGIS 生成那张“初始地理底图”，切记在 mapDisp 绘图前，注入 FontSlib 等四个符号库并调用 InitData，否则底图也出不来。并且，用Pillow重构只允许用在非DMGIS类库接口的绘图逻辑上，比如纯用QT原生接口绘图，而如果用到了DMGIS专用类库接口绘图，就绝对禁止换用Pillow。
+
+【经验包收录尾】
+
+
+
+### 📌 【DMGIS 预报制作模型 Python 映射经验包】-
+
+**[核心机制一：网格元数据安全提取与极值刷新]**
+
+* **C++ 侧**: `WDG_GetGetGridInfo(hWork, &pgrid)` 或 `WDG_GetGridInfo(hWork, ...)`
+* **Python 映射**: 统一使用安全封装的适配器接口提取元数据。
+```python
+info = GridDataInfo()
+grid_work.GetGridInfo(info) 
+
+# 极度高危：每次对网格像素进行读写修改，或者挂载了新的插值结果后，必须主动探测并刷新极值
+grid_work.UpdateZMaxMin()
+
+``
+
+**[核心机制二：矢量工作区物理边界直取]**
+
+* **C++ 侧**: `WVA_GetRect(wvhand, &rct);`
+* **Python 映射**: 直接对 `AreaWork` 工作区本身调用提取边界，无需通过提取内部多边形实体来变通。
+```python
+rct = Rct()
+areawork.GetRect(rct)
+
+``
+
+
+**[核心机制三：内存生命周期管线（最高指令：短周期插件极简托管）]**
+
+* **架构规范**: 在短生命周期模型插件中，充分利用 Python GC 机制托管业务与数据对象。
+* **禁用清理**: 严禁在代码（包括 `finally` 块）中对以下数据承载与工厂类手动调用 `.delete()`。直接无视其他旧版模版中的冗余清理代码。
+* 网格与矢量工厂：`DtmWorkShop()`, `VecWorkShop()`, `GraphWorkShop()`
+* 基础分析网格：`Grid()`
+* 三角网剖分引擎：`Tin()`
+
+
+* **必须清理的特例**: 只有显式操作底层绘图内存句柄（如 `Mapmsi` 画板、`MapDisp` 显示管线、`QPainterManager`）时，才必须严格执行手动释放，防止段错误崩溃。预报制作纯计算数值场，不涉及此部分。
+
+**[核心机制四：投影与坐标系双向转换 (MapProj)]**
+
+* **C++ 侧**: `proj_init(&oldpara, &newpara);`, `Projtolb.Convxy(dx, dy, &px, &py);`
+* **Python 映射**:
+```python
+from dmgis.mapproj.MapProj import MapProj
+from dmgis.common.dmsde import Dt
+
+# 1. 组装 old_para 和 new_para (Mpara对象) 后实例化转换器
+proj_to_jw = MapProj(old_para, new_para)
+
+# 2. 坐标转换时，参数必须使用 Dt 对象包裹传入，执行后结果回填至传入的 dt_out 对象
+dt_in = Dt(x, y)
+dt_out = Dt()
+proj_to_jw.Convxy(dt_in, dt_out)
+
+```
+
+**[核心机制五：单点取值与 TIN 空间插值标准流水线]**
+
+* **C++ 侧**: `grd_getelevationat()`, `tin_addpoint()`, `tin_calculate4pintzvalue()`, `tin_dmmesh()`
+* **Python 映射**: 标准的“取值 -> 构建三角网 -> 压入分析网格”流水线。
+```python
+from dmgis.dtm.Tin import Tin
+from dmgis.dtm.Grid import Grid
+
+# 1. 获取目标网格指定经纬度坐标的单点数值
+val = grid_analy.getelevationat(lon, lat)
+
+# 2. 实例化 TIN 引擎，构建三角网并约束极值边界 (1:1等价映射)
+contour_temp = Tin()
+contour_temp.addpoint(lon, lat, val)
+contour_temp.calculate4pintzvalue(rct)
+contour_temp.dmmesh()
+
+# 3. 将插值结果压入挂载了 grid_work 的基础网格对象
+grid_analy.addcontour(contour_temp, 1, 1)
+
+```
+【经验包收录尾】
+
+---
+
+### 【DMGIS 雷电预报与点/面矢量处理 Python 映射补充经验包】
+
+**📌 [补充机制一：矢量面工作区 (AreaWork) 的空间投影重构]**
+
+* **C++ 侧签名**:
+`WVA_PutMpara(areawork, &oldpa);`
+`WVA_ProjTralateMap(areawork, &newpa);`
+* **Python 侧映射**:
+```python
+# 必须的绝对引入路径
+from dmgis.common.dmsde import Mpara
+
+# areawork 为 VecWorkShop 获取到的面矢量工作区句柄
+putmpa = areawork.PutMpara(old_para)
+projmpa = areawork.ProjTralateMap(new_para)
+
+```
+
+
+* **排坑标记 (Marker)**:
+之前经验包中提到的 `MapProj` 主要用于离散点坐标系的换算，而 `AreaWork` 对象自身已经封装了针对整个矢量图层的投影偏转管线。直接对工作区实例调用这两个方法即可完成整图扭曲，无需拆解多边形实体。
+
+**📌 [补充机制二：点矢量工作区 (PntWork) 与点结构体 (PInf) 挂载流水线]**
+
+* **C++ 侧签名**:
+`_pinf inf; inf.Angle = 0; inf.col = 255; ...`
+`_dt pt; pt.x = lon; pt.y = lat;`
+`int index = WVP_AddObj(pntwork, &pt, &inf);`
+* **Python 侧映射**:
+```python
+# 必须的绝对引入路径
+from dmgis.common.dmsde import PInf, Dt
+
+# 1. 创建空间点坐标
+dt = Dt(lon, lat)
+
+# 2. 组装点显示信息结构体 (注意 Python 侧颜色必须直接传十进制或 clr 对象)
+pinf = PInf(
+    subno = 57,
+    Angle = 0.0,
+    Height = 0.03,
+    Wide = 0.03,
+    col = clr_val, # 例如 255 或 16711680
+    flag = 0
+)
+
+# 3. 压入点工作区
+index = pnt_work.AddObj(dt, pinf)
+
+```
+
+
+* **排坑标记 (Marker)**:
+这是构建 `.sdp`（点文件）的核心管线。参数传递时，`AddObj` 接收的必须是 `Dt` 对象和 `PInf` 结构体实例，这与面矢量工作区接收 `Se_Part` 和 `AInf` 的逻辑存在显著的类型隔离，严禁混用。
+
+**📌 [补充机制三：矢量实体数量提取（逻辑数 vs 物理数辨析）]**
+
+* **C++ 侧签名**:
+`int num = WVP_GetObjNum(pntwork);`
+`int numF = WVA_GetObjFNum(areawork);`
+* **Python 侧映射**:
+```python
+num = pnt_work.GetObjNum()   # 获取面/点实体的逻辑数
+num_f = pnt_work.GetObjFNum() # 获取面/点实体的物理数
+
+```
+
+
+* **排坑标记 (Marker)**:
+**绝对死线！** 底层 DLL 对实体数量严格区分了“逻辑数”与“物理数”（通常与内部被标记为已删除但未物理抹除的内存有关）。在翻译 C++ 源码时，必须做到 **1:1 像素级复刻**：C++ 代码调用了 `GetObjNum`，Python 就必须写 `GetObjNum()`；C++ 调用了 `GetObjFNum`，Python 就写 `GetObjFNum()`。绝不可自行脑补替换，否则在遍历实体时会引发致命的越界段错误（Segment Fault）。
+
+**📌 [补充机制四：矢量工作区落盘（覆盖保存与另存为的界限）]**
+
+* **C++ 侧签名**:
+`WVP_SaveWork(pntwork);` (保存当前修改)
+`WVA_DownLoadToFile(areawork, areapath.toLocal8Bit().data());` (另存到新路径)
+* **Python 侧映射**:
+```python
+# 场景 1：直接在已打开的源文件上覆盖保存修改
+pnt_work.SaveWork() 
+
+# 场景 2：将内存中的工作区切片另存为一个新的物理文件
+areawork.DownloadToFile(areapath)
+
+```
+
+
+* **排坑标记 (Marker)**:
+`PntWork` 与 `AreaWork` 的 `SaveWork()` 方法**不接收任何路径参数**。当需要覆盖原 `.sdp` 或 `.sda` 文件时（例如动态更新站点报警点位），直接调用无参的 `SaveWork()` 即可。只有当需要剥离出全新的外部文件时，才使用 `DownloadToFile(path)`。
+
+---

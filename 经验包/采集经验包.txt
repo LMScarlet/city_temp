@@ -1,0 +1,493 @@
+【gridcollectionnew.cpp相关经验包】
+
+### 📌 [全局底线：DLL 环境与工作区挂载]
+*   规则:
+1、任何调用 DMGis 的脚本，必须在其初始化阶段执行 DmMapCom.SetTempPath，否则 DLL 将彻底崩溃或静默失败。
+2、高危防坑：公司内部的 dmgis 类库不支持顶层模糊导入（如 from dmgis import ...），必须严格指定到具体的物理子模块路径。绝对禁止使用 try...except 包裹 import 语句，必须让路径缺失问题在编译期直接报错，防止底层对象调用时引发内存崩溃。也正因此，导入需要严格参照实例，破译员AI应当在补充经验包时额外给无法得到实例参考的转写员提供有效import导入代码
+*   **Python 侧映射**: 
+    ```python
+    from dmgis.common.DmMapCom import DmMapCom
+    self.temp_path = os.path.join(os.getcwd(), "DmCloudService", "PluginLibrary", "temp")
+    self.dm_map_com = DmMapCom()
+    self.dm_map_com.SetTempPath(self.temp_path)
+    ```
+*   **排坑标记 (Marker)**: 路径必须精准指向 Python 项目根目录下的 `DmCloudService/PluginLibrary/temp`。如果此目录缺失或路径指向错误，后续所有涉及 `DtmWorkShop` 或 `Grid` 的实例化都会导致底层报错。
+
+### 📌 [阶段一：引擎与工作区生命周期管理]
+*   **C++ 侧签名**: `m_sdhand = SD_Create();`, `aii = SD_CreateGridWork(m_sdhand);`, `WDHAND grid = SD_GetWorkByNo(m_sdhand,aii);`, `SD_DelWorkByNo(m_sdhand, aii);`, `SD_Delete(m_sdhand);`
+*   **Python 侧映射**: 
+    *   引擎初始化：`dtmWorkShop = DtmWorkShop()`
+    *   创建与获取工作区：`ai = dtmWorkShop.CreateGridWork()`, `gridWork = dtmWorkShop.GetWorkByNo(ai)`
+    *   单点工作区释放：`dtmWorkShop.DelWorkByNo(ai)`
+*   **排坑标记 (Marker)**: 绝对禁止在 while 或 for 的长循环中只 CreateGridWork 而不 DelWorkByNo。在业务异常（try...finally 或 catch 块）中，针对单次循环生成的网格 ID，必须执行 DelWorkByNo；在整个类实例销毁或任务结束时，Python这边没必要执行 delete()，因为有GC机制。
+
+### 📌 [阶段二：结构体映射与网格元数据构建]
+*   **C++ 侧签名**: `_rct gridRect;`, `gridDataInfo pinfo;`, `pinfo.xMin = xmin; ...`, `WDG_Create(grid,&pinfo);`
+*   **Python 侧映射**: 必须引入 `from dmgis.common.dmsde import Rct`。
+    ```python
+    clip_rect = Rct()
+    clip_rect.xmin = global_config.xmin
+    clip_rect.xmax = global_config.xmax
+    clip_rect.ymin = global_config.ymin
+    clip_rect.ymax = global_config.ymax
+    
+    gridinfo = GridDataInfo()
+    gridinfo.xMin = clip_rect.xmin # 以此类推
+    gridWork.Create(gridinfo)
+    ```
+*   **排坑标记 (Marker)**: Python 侧在计算 `cols` 和 `rows` 时若出现浮点除法，必须强制转为 `int`，保证底层内存开辟尺寸的绝对准确。
+
+### 📌 [阶段三：格点像素级数据注入]
+*   **C++ 侧签名**: `WDG_SetValue(grid, Nj-m-1, n, val);`
+*   **Python 侧映射**: `gridWork.SetValue(row, col, val)`
+*   **排坑标记 (Marker)**: 由于内部封装层暂未暴露出接受 Numpy 数组的批处理接口，在 Python 端执行此操作时，需维持 C++ 的双层遍历逻辑完成单点注入。
+
+### 📌 [阶段四：裁切与极值刷新]
+*   **C++ 侧签名**: `WDG_ClipGirdRect(grid, &gridRect);`, `WDG_UpdateZMaxMin(grid);`
+*   **Python 侧映射**: `gridWork.ClipGirdRect(prc)`, `gridWork.UpdateZMaxMin()`
+*   **排坑标记 (Marker)**: 必须先执行 `UpdateZMaxMin()`，再执行 `ClipGirdRect()` 裁剪，裁剪完成后必须**再次**调用 `UpdateZMaxMin()`，顺序与 C++ 源码保持绝对一致，否则会导致图形引擎无法识别裁剪后的最新极值，引发空指针异常或黑图。
+
+### 📌 [阶段五：文件落盘与持久化]
+*   **C++ 侧签名**: `WDG_SaveWork(grid, strMicaps.toStdString().c_str());`, `WDG_WriteFile(grid, strMicaps.toStdString().c_str());`
+*   **Python 侧映射**: `gridWork.SaveWork(path)`, `gridWork.WriteFile(path)`
+*   **排坑标记 (Marker)**: 注意 C++ 源码中的重命名逻辑。C++ 在保存原始网格后，主动执行了删除旧文件并加上 `_c` 后缀再次落盘。在 Python 转写时需调用 `os.remove(path)` 复刻此文件系统流转逻辑。
+
+### 📌 [附加组件一：Eccodes 多场消息与指针管理]
+*   **C++ 侧签名**: `codes_grib_multi_support_off(NULL); codes_grib_multi_support_on(NULL);`
+*   **Python 侧映射**: 在读取 GRIB 文件前，需显式开启多场消息支持，防止数据丢失：`eccodes.codes_grib_multi_support_on()`。
+
+### 📌 [附加组件二：遗漏业务流水线：本地共享盘数据处理 (CreateGridSJH)]
+*   **C++ 侧逻辑**: 从 `/data/CMADAAS/DATA/NAFP/...` 等本地挂载盘直接读取 `.grib1` 或 `.grib2`。
+*   **Python 侧映射**: 必须在 Python 类中复刻此方法。使用 `os.listdir` 或 `glob` 扫描匹配特定日期和要素的文件，后续的 eccodes 解析与 dmgis 裁剪逻辑与网络下载的数据处理流水线完全一致。
+
+📌 [补充经验一：警惕因“物理环境差异”导致的 C++ 冗余死代码]
+雷区重现: C++ 源码中常常并存“走 HTTP 调用天擎 API” 和 “走本地 Linux 磁盘直读 /data/CMADAAS/...” 两条并行的数据获取管线。这是因为老版本曾部署在气象局挂载了 NAS 盘的特定服务器上。而新的玉林现场已经没有这种挂载盘了。
+
+避坑指南 (Marker): 在翻译业务管线时，若遇到读取绝对路径如 /data/... 或 D:/... 这种硬编码的磁盘扫描逻辑（如 CreateGridSJH 等分支），请先向项目负责人核实新现场是否具备该物理条件。如果不具备，果断删除该条死代码管线，保持核心流的纯粹，切忌盲目照搬。
+```
+【provgriddatacollect.cpp相关经验包】
+
+**📌 [API / 核心功能名称：网格多场叠加与累加运算]**
+
+* **C++ 侧签名**: `HDGRID gridAnaly = grd_create();`, `grd_setgridwork(gridAnaly,lastGrid);`, `grd_addgrid(gridAnaly, grid, 1, 1);`
+* **Python 侧映射**:
+```python
+grdanalysis = Grid()
+grdanalysis.setgridwork(lastGrid) # lastGrid 为基底网格
+grdanalysis.addgrid(gridWork, 1, 1) # gridWork 为待叠加网格
+
+```
+* **参数与类型交接**: Python 端的 `dmgis.dtm.Grid` 类实现了叠加逻辑。C++ 传入的两个网格变量均对应 Python 中已持有的 `DtmGridWork` 实例。
+* **排坑标记 (Marker)**:
+1. **算法调用死线**：绝对禁止提取矩阵在外部（如 Numpy）进行加法运算后再重新塞回网格，必须直接调用原生的 `addgrid`，以确保底层元数据不丢失且极值不越界。
+2. **对象保存陷阱**：`Grid` (`grdanalysis`) 纯粹是个无存储的算法引擎，`setgridwork` 的本质是挂载目标物理内存。执行叠加后，数据突变直接发生在被绑定的基底 `lastGrid` (`DtmGridWork` 对象) 内部。**最终落盘时，必须调用 `lastGrid.UpdateZMaxMin()` 和 `lastGrid.WriteFile(path)`，切勿对 `Grid` 引擎本身执行保存操作。**
+
+**📌 [API / 核心功能名称：格点像素级数据注入 (正逆序控制)]**
+
+* **C++ 侧签名**: `WDG_SetValue(grid,m,n,val);`
+* **Python 侧映射**: `gridWork.SetValue(row, col, val)`
+* **参数与类型交接**: 双层 `for` 循环的变量 `m` (行) 和 `n` (列) 直接映射为 `SetValue` 的 `row` 与 `col`。
+* **排坑标记 (Marker)**: **高危翻车点！** 在解析 `NAFP_NWFP_SPCC`（省台精细化）数据源时，C++ 源码是严格按照坐标系**正序**注入的（`m, n`）。这与欧洲中心/T639 默认的**倒序**注入（`Nj-m-1, n`）截然不同。编写 Python 业务脚本时，必须针对省台数据源维持纯粹的正序双层遍历，若盲目套用倒序模板，将导致切出的网格影像在纬度（Y轴）上完全颠倒。
+
+**📌 [API / 核心功能名称：Eccodes 气象极值掩码保护]**
+
+* **C++ 侧签名**: `if(addName.contains("TMP")) val = val - 273.15;`
+* **Python 侧映射**: `values = np.where(values != 9999.0, values - 273.15, values)`
+* **参数与类型交接**: 将 C++ 注入前逐点的算术运算，改为 Numpy 读取出 `values` 矩阵后的整体矢量化运算。
+* **排坑标记 (Marker)**: 必须在执行气象公式（如温度 `- 273.15`，云量 `/ 10`）前，使用 `np.where` 对缺测极值 `9999.0` 进行隔离保护。如果直接对矩阵广播运算，缺测值会异变为 `9725.85` 等脏数据并混入引擎，这将彻底摧毁后续 `WDG_UpdateZMaxMin()` 的极值探测器，导致调色板失效。
+
+**📌 [API / 核心功能名称：风场 U/V 分量文件路由]**
+
+* **C++ 侧签名**: `if ((mcount - 1) % 2 == 0) ... strMicaps.replace(addName, addName + ".U");`
+* **Python 侧映射**:
+```python
+if (mcount - 1) % 2 == 0:
+    str_micaps = str_micaps.replace(add_name, f"{add_name}.U")
+
+```
+
+* **参数与类型交接**: Python 字符串替换逻辑。`mcount` 为当前遍历的 GRIB 消息体索引。
+* **排坑标记 (Marker)**: 针对省台风场 GRIB 报文的 U/V 拆分，必须**严格复刻 C++ 源码中依赖消息体索引奇偶性（`(mcount - 1) % 2 == 0`）的路由判定**。禁止自作主张去解析 `parameterNumber` 或其他气象属性，保证与历史架构的数据输出逻辑绝对一致。
+
+**📌 [API / 核心功能名称：GIS 图形渲染引擎与强制销毁管线]**
+
+* **C++ 侧签名**: `LYR_GetImage`, `Is_SavePng`
+* **Python 侧映射**:
+```python
+image = Mapmsi()
+image.CreateImg(wid, hei, 32)
+q_painter = QPainterManager()
+q_painter.GetQPainterHandle(image.handle)
+mapDisp = MapDisp()
+mapDisp.InitPartWindow2(q_painter.handle, 0, 0, wid, hei, rct)
+# ... 执行绘图 ...
+image.SavePng(path)
+
+```
+
+* **参数与类型交接**: 像素画板 (`Mapmsi`)、Qt画笔管理器 (`QPainterManager`) 与 显示控制器 (`MapDisp`) 必须联合使用。
+* **排坑标记 (Marker)**: **高危内存泄漏预警！** 上述三大图形渲染对象产生的句柄无法被 Python 的自动垃圾回收（GC）机制安全处理。在完成图片保存后，**必须且只能**按照以下绝对顺序执行显式析构：
+1. `mapDisp.delete()`
+2. `q_painter.DeleteQPainter()`
+3. `image.delete()`
+顺序颠倒或遗漏调用，将导致底层 DLL 锁死或进程崩溃。
+
+
+**📌 [API / 核心功能名称：高级空间插值计算器内存回收]**
+
+* **C++ 侧签名**: `tin.dmmesh();`, `kig.interpolation();`
+* **Python 侧映射**: `tin = Tin()`, `kig = Kig(0)`
+* **参数与类型交接**: 实例化后，通过 `grd.addkriging(kig)` 或 `grd.addcontour(tin)` 将计算结果压入网格。
+* **排坑标记 (Marker)**: `Tin`（三角网）与 `Kig`（克里金）在执行插值运算后，其底层持有着庞大的临时空间矩阵内存，且无法被 Python 自动释放。当插值结果被推入网格后，必须立即调用 `tin.delete()` 或 `kig.delete()` 进行显式销毁。注意：`DtmWorkShop` 生成的工作区（如 `ai`）不在此列，Python 会自动回收，无需调用 `DelWorkByNo`。
+
+**📌 [API / 核心功能名称：Eccodes 多场消息安全策略]**
+
+* **C++ 侧签名**: `codes_grib_multi_support_on(NULL);`
+* **Python 侧映射**: `eccodes.codes_grib_multi_support_on()`
+* **参数与类型交接**: 全局环境设置，无需传参。
+* **排坑标记 (Marker)**: 在执行 `codes_grib_new_from_file` 迭代读取数据前必须调用此全局开关，防止包含多场数据的 GRIB 报文在读取时发生数据截断或丢片。
+
+【cmagfszerocollect.cpp相关经验包】
+📌 [API / 核心功能名称：空间单点属性插值提取 (网格取值)]
+
+C++ 侧签名: double val = grd_getelevationat(grdana, lon, lat);
+
+Python 侧映射: val = grdanalysis.getelevationat(lon, lat)
+
+参数与类型交接: Python 端的 dmgis.dtm.Grid 实例暴露出 getelevationat(x, y) 方法。x 与 y 分别对应待查询站点的经度 (lon) 和纬度 (lat)。
+
+排坑标记 (Marker): 返回值陷阱预警！ C++ 源码在执行完 grd_getelevationat 后，存在一个 if (val >= 0) 的判断逻辑。这是因为当目标站点的经纬度坐标超出了当前加载网格的地理边界（Bounding Box），或者网格上的该点为无效缺测值时，底层的 DMGis 算法会返回一个小于 0 的错误码（如 -1 或其他负极值）。Python 转写时必须严格继承这个 val >= 0 的边界保护判定，否则会将越界的负向异常高度值混入站点数据库。
+
+（另外：Python 端的 Grid 对象在使用完毕后无需调用 delete() 或手动销毁句柄，其生命周期与内存回收由系统自动托管，这是它与 Tin、Kig 等算法引擎的显著区别。）
+
+这个考虑非常周到且致命！如果第三阶段的转写员手里没有 `Mapmsi.py` 和那些实例源码，只看我之前的经验包，他绝对写不出正确的 `import` 路径，遇到句柄包装也会直接抓瞎。
+
+为了确保转写员能“开箱即用”**、仅凭这份经验包就能完美复刻出雷达的渲染流水线，我进行了一次深度自检，补全了所有底层类的**绝对引入路径，并专门增加了一个关于“单层出图捷径”的防误导声明。
+
+请将以下这份《DMGis Python 接口映射与排坑经验包：雷达影像篇 (完整定稿版)》收录进你的知识库并分发给后续的转写员：
+
+---
+
+ 📌 【radartqcollect.cpp相关经验包】
+
+#### 📌 [API / 核心功能名称：独立 GIS 工程加载与图层解耦]
+
+* **C++ 侧签名**:
+`WithGisWidget::m_ConsloeUi->m_LDPrj;`
+`radarLayer = PRJ_GetLayerByLayName(WithGisWidget::m_ConsloeUi->m_LDPrj,"ld");`
+* **Python 侧映射**:
+必须在业务子线程中独立实例化工程，绝不能跨线程调用 UI。
+```python
+# 【必须的绝对引入路径】
+from dmgis.layer.DmPrj import DmPrj
+
+# 实例化并动态拼接路径，摒弃 UI 依赖
+prj = DmPrj()
+prj_path = os.path.join(os.getcwd(), "yulincollectdata", "map", "Collect_Rad.prj")
+prj.OpenPrj(prj_path)
+rad_layer = prj.GetLayerByLayName("ld") # C++源码中图层名写死为 "ld"
+
+```
+
+* **排坑标记 (Marker)**: **多线程安全红线**。Python 必须自己维护 `DmPrj` 的生命周期，每个任务加载一次工程，切勿模仿 C++ 把它绑定在全局主界面上。
+
+#### 📌 [API / 核心功能名称：投影参数构造与空间坐标极值换算]
+
+* **C++ 侧签名**:
+`mpara.projType = PRJ_Lambert_Conformal_Conic;`
+`proj_Convxy(Projtolb, LDRect.xmin, LDRect.ymin, &xx1, &yy1);`
+* **Python 侧映射**:
+```python
+# 【必须的绝对引入路径】
+from dmgis.common.dmsde import Mpara, Dt
+from dmgis.common.DmEnumType import ProjectionType, EarthParamType
+from dmgis.mapproj.MapProj import MapProj
+
+# 1. 构造兰伯特投影参数 (严格参照 C++ 的硬编码参数)
+mpara = Mpara()
+mpara.projType = ProjectionType.PRJ_Lambert_Conformal_Conic
+mpara.earthParam = EarthParamType.EP_WGS84
+mpara.lon = 110.0
+mpara.lat = 30.0
+mpara.lat1 = 30.0
+mpara.lat2 = 60.0
+
+# 2. 构造经纬度投影参数
+mparaNew = Mpara()
+mparaNew.projType = ProjectionType.PRJ_LonLat
+mparaNew.earthParam = EarthParamType.EP_CGCS2000
+
+# 3. 极值转换引擎
+proj_to_lb = MapProj(mpara, mparaNew)
+dt_in = Dt(ld_rect.xmin, ld_rect.ymin)
+dt_out = Dt()
+proj_to_lb.Convxy(dt_in, dt_out) # dt_out.x 和 dt_out.y 即为转换后的坐标
+
+```
+
+* **排坑标记 (Marker)**: C++ 中通过 4 次 `proj_Convxy` 分别测算 4 个角点的极值并用 `qMin/qMax` 求出最终经纬度范围。在 Python 重写时，**必须老老实实写 4 次转换**并手动计算最大最小值，确保裁切边界无缝贴合。
+
+#### 📌 [API / 核心功能名称：雷达基数据挂载与物理边界探测]
+
+* **C++ 侧签名**:
+`LYR_SetRadFile(radarLayer, ldPath.toLocal8Bit().data(), 1);`
+`LYR_GetLayerRect(radarLayer, &LDRect);`
+* **Python 侧映射**:
+```python
+# 【必须的绝对引入路径】
+from dmgis.common.dmsde import Rct
+
+# 确保 ld_path (.bz2 解压后的文件) 存在后再挂载
+rad_layer.SetRadFile(ld_path)
+ld_rect = Rct()
+rad_layer.GetLayerRect(ld_rect) # 底层回填雷达边界
+
+```
+
+#### 📌 [API / 核心功能名称：雷达影像渲染与纠偏流水线 (含单层出图特例说明)]
+
+* **C++ 侧签名**:
+`ISHAND image = LYR_GetImage(radarLayer, iwid, ihei, &LDRect, RGB(0,0,0));`
+`Is_PutMpara(image, &mpara);` -> `Is_ProjTralateMap(image, &mparaNew);`
+`Is_SavePng(image, ldImgPathjw);` -> `IS_Free(image);`
+* **Python 侧映射**:
+# 【必须的绝对引入路径】
+from dmgis.common.dmsde import clr
+
+# 1. 直接提取健全的 Mapmsi 图像实例 (切忌二次包装)
+image = rad_layer.GetImage(iwid, ihei, ld_rect, clr(0x000000))
+
+if image and hasattr(image, 'handle') and image.handle:
+    # 2. 注入原投影 (兰伯特)
+    image.PutMpara(mpara)
+    # 3. 投影扭曲纠偏 (转经纬度，防止前端贴图偏移)
+    image.ProjTralateMap(mparaNew)
+    # 4. 落盘保存
+    image.SavePng(ld_img_path_jw)
+    # 5. 强制释放底层内存
+    image.delete()
+
+* **排坑标记 (Marker)**:
+1. **关于 `MapDisp` 和 `QPainterManager` 的避坑声明**：在常规的 DMGis 综合出图（即渲染整个工程）时，必须引入“三剑客”（Mapmsi, QPainterManager, MapDisp）并按序销毁。**但是！本雷达脚本的 C++ 源码走的是“单图层直出捷径”（调用了 `LYR_GetImage`）**，这直接跳过了画笔和渲染调度器。因此，在 Python 转写时，**绝对不需要**引入和实例化 `MapDisp` 和 `QPainterManager`，只需严格保证 `image.delete()` 的执行即可。
+2. **内存黑洞预警**：`image.delete()` **必须放在 `finally` 块中确保执行**。如果 Python 因为中间的逻辑报错跳过了销毁，底层 DLL 内存将迅速溢出导致程序崩溃。
+
+📌 [全局避坑底线：常驻服务 (Daemon) 下的 C++ 句柄显式释放法则]
+现象误区：在编写单次运行的 Python 测试脚本（如 API 测试、画图 Demo）时，往往不需要手动释放 DmPrj 或其他底层句柄，因为 Python 进程结束后，操作系统会强制回收所有内存。这容易给开发者造成“不需要手动销毁”的假象。
+致命隐患：本系统是一个 7x24 小时运行的后台常驻服务。在 withgis 架构中，由于采用了定时器+线程池（QTimer + QRunnable）的调度模式，每次定时任务触发时，都会重新 new 一个采集类实例（如 RadarCollector），并随之创建底层的 C++ 工程对象（如 DmPrj）。
+底层真相：Python 的垃圾回收机制（GC）是基于引用计数的。对于 dmgis 这类经过封装的 C++ 库，Python 的 GC 只能看到外层一个极其轻量级的“壳对象”，它完全不知道底层 DLL 实际上在堆区开辟了多大的地图工程或位图内存。如果依赖 Python 的自动 GC 慢慢回收，C++ 底层的内存堆积速度将远超回收速度，最终引发服务器 OOM（内存溢出）崩溃。
+铁律 (Marker)：凡是在定时循环或长生命周期内反复实例化的 DMGis 对象（特别是 DmPrj 工程句柄、Mapmsi 图像句柄、以及 Tin/Kig 等空间算法矩阵），在任务执行完毕后，必须无条件、显式地调用该对象的 delete() 或 Free() 方法！ 绝不能抱有“等 Python 自动回收”的侥幸心理。
+
+
+收到！作为你的“DMGis 类库逆向破译专员”，我已经全面研读了你发来的项目总方案、C++ 源码（`cloudimage.cpp`）以及 Python 端的参考实例（`layer_test.py` 和 `5.13.1.py`）。
+
+你和项目设计 AI 梳理的骨架非常清晰。在仔细比对风云二号（FY2G）卫星影像的处理逻辑后，我发现**云图的底层渲染流水线（AWX 解析 -> 投影纠偏 -> 导出 PNG）与之前的雷达图（Radar）具有高度的同源性**，都采用了“单图层直出捷径”。但在具体的方法层级调用上，Python 端与 C++ 端存在一些由于面向对象封装带来的细微差异。
+
+我已严格按照契约格式，为你提炼出了这份专属于“风云卫星云图”的经验包。请将以下内容直接收录，供第三阶段的转写员使用：
+
+---
+
+【cloudimage.cpp相关经验包：FY2G风云卫星影像篇】
+
+### 📌 [API / 核心功能名称：独立 GIS 工程加载与风云图层解耦]
+
+* **C++ 侧签名**:
+`m_YTPrj = PRJ_Create();`
+`PRJ_OpenPrj(m_YTPrj,ytprj.toLocal8Bit().data());`
+`LYHD ytlayer = PRJ_GetLayerByLayName(WithGisWidget::m_ConsloeUi->m_YTPrj, "yt2");`
+* **Python 侧映射**:
+必须在卫星云图采集的子线程内独立完成工程实例化。
+```python
+# 【必须的绝对引入路径】
+from dmgis.layer.DmPrj import DmPrj
+
+# 实例化并动态拼接路径，摒弃对 UI (m_ConsloeUi) 的依赖
+prj = DmPrj()
+prj_path = os.path.join(os.getcwd(), "yulincollectdata", "map", "Collect_Cloud.prj")
+prj.OpenPrj(prj_path)
+
+# 获取云图专属图层
+cloud_layer = prj.GetLayerByLayName("yt2")
+
+```
+* **参数与类型交接**: Python 端返回的 `cloud_layer` 实际上是一个 `FlyLayer` 类型的实例句柄。
+* **排坑标记 (Marker)**: **多线程绝对红线**。与雷达模块一样，系统是常驻服务。Python 必须在每次执行定时采集任务时，自己在 `Worker` 线程内部维护 `DmPrj` 的生命周期，切忌将 `prj` 挂载到全局或跨线程调用，并在任务结束（如 `finally` 块或对象的 `__del__` 方法）时调用 `prj.delete()` 释放底层内存。
+
+### 📌 [API / 核心功能名称：AWX 云图文件挂载与边界探测]
+
+* **C++ 侧签名**:
+`LYY_SetFlyFile(ytlayer, ytPath.toLocal8Bit().data());`
+`_rct rect;`
+`LY_GetRect(ytlayer, &rect);`
+* **Python 侧映射**:
+```python
+# 【必须的绝对引入路径】
+from dmgis.common.dmsde import Rct
+
+# 1. 挂载本地 AWX 数据文件
+cloud_layer.SetFlyFile(yt_path)
+
+# 2. 提取图层工作区并获取边界
+rect = Rct()
+work = cloud_layer.GetWork()
+if work:
+    work.GetRect(rect)
+
+```
+* **参数与类型交接**: 传入解压后或下载好的 `.AWX` 物理文件绝对路径。底层 `dmgis` 库会自动解析文件的空间属性。
+* **排坑标记 (Marker)**: **层级调用变更预警！** 在 C++ 中，直接通过 `LY_GetRect(ytlayer, ...)` 就能拿到图层矩形范围；但在 Python 端的封装中（参考 `layer_test.py`），`FlyLayer` 自身并没有暴露出直接获取范围的方法。**转写员必须先调用 `GetWork()` 提取内部的工作区实例，再调用 `work.GetRect(rect)**` 才能成功回填空间边界数据。直接对 `cloud_layer` 调用获取矩形的方法会导致 `AttributeError` 崩溃。
+
+### 📌 [API / 核心功能名称：投影参数组装 (兰伯特至经纬度)]
+
+* **C++ 侧签名**:
+`_mpara oldpara = _mpara(); oldpara.projType = PRJ_Lambert_Conformal_Conic; ...`
+`_mpara newparajw = _mpara(); newparajw.projType = PRJ_LonLat; ...`
+* **Python 侧映射**:
+```python
+# 【必须的绝对引入路径】
+from dmgis.common.dmsde import Mpara
+from dmgis.common.DmEnumType import ProjectionType, EarthParamType
+
+# 构造云图原始投影 (兰伯特)
+old_para = Mpara()
+old_para.projType = ProjectionType.PRJ_Lambert_Conformal_Conic
+old_para.earthParam = EarthParamType.EP_CGCS2000
+old_para.lon = 110.0
+old_para.lat = 30.0
+old_para.lat1 = 30.0
+old_para.lat2 = 60.0
+
+# 构造输出投影 (经纬度)
+new_para_jw = Mpara()
+new_para_jw.projType = ProjectionType.PRJ_LonLat
+new_para_jw.earthParam = EarthParamType.EP_CGCS2000
+new_para_jw.dx = 0.0
+new_para_jw.dy = 0.0
+
+```
+* **参数与类型交接**: 严格使用 `DmEnumType` 中的枚举值替代 C++ 的宏定义（如 `EP_CGCS2000`）。
+* **排坑标记 (Marker)**: 虽然这里组装了投影参数，但**绝对不要**像雷达模块那样使用 `MapProj` 去做四个角点的极值换算 (`proj_to_lb.Convxy`)。云图的 C++ 源码中，直接采用了整图空间扭曲的策略。老老实实把这两个 `Mpara` 对象交给后面的 `Mapmsi` 去处理即可。
+
+### 📌 [API / 核心功能名称：卫星影像渲染与空间扭曲纠偏 (单图层直出捷径)]
+
+* **C++ 侧签名**:
+`ISHAND image = LYY_GetImage(ytlayer, iwid, ihei, &rect, qRgb(0, 0, 0));`
+`Is_PutMpara(image, &oldpara);`
+`Is_ProjTralateMap(image, &newparajw);`
+`Is_SavePng(image,savePath2.toLocal8Bit().data());`
+`IS_Free(image);`
+* **Python 侧映射**:
+```python
+# 【必须的绝对引入路径】
+from dmgis.common.dmsde import clr
+
+# 1. 按照比例计算出图高度 (必须防除零与空高度)
+if rect.xmax == rect.xmin or rect.ymax == rect.ymin:
+    return False
+    
+dscale = (rect.ymax - rect.ymin) / (rect.xmax - rect.xmin)
+iwid = 1000
+ihei = int(round(iwid * dscale))
+
+# 2. 直接提取健全的 Mapmsi 图像实例 (切忌二次包装)
+image = cloud_layer.GetImage(iwid, ihei, rect, clr(0x000000))
+
+if image and hasattr(image, 'handle') and image.handle:
+    try:
+        image.PutMpara(old_para)
+        image.ProjTralateMap(new_para_jw)
+        image.SavePng(save_path2)
+    finally:
+        # 3. 强制释放底层内存
+        image.delete()
+```
+参数与类型交接: 无论雷达层还是风云层，其 GetImage 方法返回的直接就是一个健全的 Mapmsi 对象实例。颜色参数必须使用 clr(0x000000) 表示纯黑透明底。
+排坑标记 (Marker) 必须新增一条死线：严禁对图像句柄进行二次包装！ 绝对不能写出 Mapmsi(image.handle) 这种画蛇添足的代码。由于底层 C++ 胶水层已完成面向对象处理，强行二次包装不仅会导致运行时报错，还会剥夺底层的 _release 释放权。如果在 finally 块里调用 delete() 时底层认为自己没有释放权，将造成堆内存彻底泄漏，直接干穿服务器。
+
+【cloud3dimage.cpp 相关经验包：FY3D 极轨卫星直出渲染篇】
+
+📌 **[API / 核心功能名称：网格独立调色板强制注入]**
+
+* **C++ 侧签名**:
+`double valset[7]{...};`
+`_clr clrset[7]{...};`
+`WDG_SetIntervalColorList(gridWork, 7, valset, clrset);`
+* **Python 侧 / 第三方库映射**:
+无需像 C++ 那样声明底层数组类型，Python 侧根据 `DtmGridWork` 的封装，直接传递标准 `list` 即可。
+```python
+# 【必须的绝对引入路径】
+from dmgis.common.dmsde import clr
+
+# 严格对齐 C++ 的硬编码数组范围
+valset = [-2000.0, 0.0, 1000.0, 1500.0, 2000.0, 2500.0, 3000.0]
+# C++ 的整数颜色必须用 clr() 包装
+clrset = [clr(0), clr(16448250), clr(12110806), clr(8428986), clr(5013670), clr(7594692), clr(2529921)]
+
+# 注入调色板
+grid_work.SetIntervalColorList(7, valset, clrset)
+
+```
+* **参数与类型交接**: Python 端直接传原生 `list`，但列表内的元素必须严格是 `float` 和 `clr` 对象。底层会自动完成 `c_double` 等 ctypes 的转换。
+* **排坑标记 (Marker)**: **底层数组越界红线**。传入的 `num` 参数（此处为 7）必须和 `valset` 与 `clrset` 列表的实际长度绝对相等！底层 DLL 函数缺乏高级语言的长度越界校验，一旦长度错位，会直接导致指针越界读取，引发 C++ 层面的 `Segment Fault` 进程秒崩。
+
+📌 **[API / 核心功能名称：网格直出图形句柄与跨语言二次包装]**
+
+* **C++ 侧签名**:
+`ISHAND img = WDG_GetHImage(gridWork);`
+`Is_SavePng(img, savePath2.toLocal8Bit().data());`
+* **Python 侧 / 第三方库映射**:
+`WDG_GetHImage` 返回的是 `c_void_p` 裸指针，Python 端必须引入 `Mapmsi` 进行手动包裹后，才能调用保存方法。
+```python
+# 【必须的绝对引入路径】
+from dmgis.Mapmsi.Mapmsi import Mapmsi
+
+# 1. 从网格中榨取底层图像指针 (返回 c_void_p)
+img_handle = grid_work.GetHImage()
+
+if img_handle:
+    # 2. 核心操作：将裸指针传入 Mapmsi 构造函数进行二次包装
+    # 注意：由于显式传入了 handle，Mapmsi 底层的 _release 会自动设为 False
+    image = Mapmsi(handle=img_handle)
+
+    # 3. 调用包装后的方法安全落盘
+    image.SavePng(save_path2)
+
+    # 【防雷死线】：绝对不要在这里调用 image.delete()！
+
+```
+* **参数与类型交接**: `grid_work.GetHImage()` 返回的裸指针直接作为关键字参数 `handle` 传递给 `Mapmsi` 构造函数。
+* **排坑标记 (Marker)**: **内存所属权红线！** 在雷达和 FY2G 云图的业务中，我们使用的是 `cloud_layer.GetImage()`，该方法生成的图像内存是独立的，因此**必须**在 `finally` 中调用 `image.delete()` 释放；
+但是！在 FY3D 业务中，图像是使用 `GetHImage()` 直接从 `grid_work` 内部提取出来的寄生对象。Python 端对其进行二次包装完成操作后，**绝对禁止**调用 `image.delete()`。该图像内存由 `grid_work` 托管，会随网格一起销毁。如果 Python 强行释放，将引发“Double Free（二次释放）”，导致网格引擎销毁时发生不可逆的内存崩溃。
+
+【cloud4bimage.cpp 相关经验包：FY4B 极轨卫星数据篇】
+
+### 📌 [API / 核心功能名称：网格基准信息反向提取]
+
+* **C++ 侧签名**:
+`WDG_UpdateZMaxMin(gridWork);`
+`WDG_GetGetGridInfo(gridWork, &gridinfo);`
+* **Python 侧映射**:
+
+```python
+# 【必须的绝对引入路径】
+from dmgis.common.dmsde import GridDataInfo
+
+grid_work.UpdateZMaxMin()
+
+# 帮别人理解：实例化一个空的结构体对象，作为容器传给底层，用来接收并回填极值数据
+grid_info = GridDataInfo()
+
+grid_work.GetGetGridInfo(grid_info)
+
+jwlrc_xmin = grid_info.xMin
+jwlrc_ymin = grid_info.yMin
+jwlrc_xmax = grid_info.xMax
+jwlrc_ymax = grid_info.yMax
+
+```
+* **参数与类型交接**: Python 端只需将实例化的 `GridDataInfo` 对象传入，底层 DLL 执行完毕后会直接修改该实例的属性，后续直接读取 `grid_info.xMin` 等即可。
+* **排坑标记 (Marker)**: **高危拼写雷区**！根据底层的 Python 插件实例源码证实，封装层直接继承了 C++ 源码中略显怪异的命名方式（`GetGetGridInfo`）。如果强行纠正拼写，会导致 `AttributeError` 找不到方法，直接引发程序崩溃。
+
+*(注：关于 FY4B 的独立调色板注入 `SetIntervalColorList`、图像裸指针提取 `GetHImage` 与 `Mapmsi` 二次包装保存流水线，由于其底层逻辑与 FY3D 业务 100% 同源，直接复用【cloud3dimage.cpp 相关经验包】即可。)*
+---
+
+【经验包收录尾】

@@ -1,0 +1,413 @@
+【DMGIS 数据处理公共方法类 Python 映射经验包】
+
+> **📌 [全局底线：环境初始化与内存释放]**
+> * **绝对铁律1**：无论在哪个模块实例化 `DmMapCom`，必须优先调用 `SetTempPath`。
+> * **绝对铁律2 (内存释放)**：针对常驻后台的定时任务，**严禁使用 Python 的 `__del__` 魔术方法**来释放 DMGIS 句柄（极易因 GC 延迟导致 DLL 内存撑爆）。必须在类中提供显式的 `dispose()` 方法（内部调用 `delete()`），并在业务层 `finally` 块中强制调用回收！
+
+> **📌 [高危警告：DMGIS 结构体与类型映射红线]**
+> 1. **颜色结构体 `clr`**：Python 中的 `clr` 是 `c_uint32`，**只接收单参数整型**！绝不能写成 `clr(R,G,B)`。白色必须写为 `clr(16777215)` 或 `clr(0xFFFFFF)`。
+> 2. **线型属性 `LInf`**：严格注意大小写，是大写的 `I` (`LInf`)，不是 `Linf`。
+> 3. **图层状态枚举**：对应的 Python 枚举类名叫 `LayerDispType` (如 `LayerDispType.LAYDISP_DISP`)，不存在 `LayerDispState`。
+> 4. **工作区下载**：另存为文件的接口是 `DownloadToFile(path)`，注意中间的 load 的 `l` 是**小写**，严禁照抄 C++ 的 `DownLoadToFile`。
+
+> **📌 [接口映射：等值线/面生成管线 (DrawContourWorks)]**
+> * **C++ API 追踪**：`tin_create()` -> `tin_dmmesh()` -> `grd_addcontour()` -> `grd_addcontour1()` -> `grd_contourhandling()` -> `grd_getareawork()`
+> * **Python 映射策略**：
+> 1. 使用 `dmgis.dtm.Tin` 进行插值：`tin.addpoint()`, `tin.calculate4pintzvalue(rct)`, `tin.dmmesh()`。
+> 2. 使用 `dmgis.dtm.Grid` 承接：`grd.setgridwork(analyGrid)`, `grd.addcontour(tin, 1, 1)`。
+> 3. **注意**：在提取等值面边界生成 SDA 矢量文件时，C++ 使用了平滑和矢量化接口（`grd_setsleek`, `grd_producecontourline`, `grd_contourhandling`）。在 Python 中调用这些对应接口时，必须先确认极值已通过 `gridWork.UpdateZMaxMin()` 更新。
+> > 4. **图层覆盖**：使用 `getareawork` 切出矢量面后，若需覆盖原工程图层，必须调用 `dzm_work.GetWorkName()` 获取原名，然后使用 `area_work.DownloadToFile(work_name)` 进行覆盖，最后让原图层 `ReReadWork()` 并 `ReLoad()`。
+
+> **📌 [接口映射：出图与图层管控 (SaveSingleFactorImage)]**
+> * **C++ API 追踪**：`PRJ_GetLayerByLayName` -> `LYM_GetWork` -> `WVA_DelObj` -> `DD_Create` -> `PRJ_DrawPrj`
+> * **Python 映射策略**：
+> 1. 清理图层：获取 `MapLayer` -> 获取 `AreaWork` 等 -> 循环 `DelObj()` 删空实体 -> 保存。
+> 2. **渲染管线 (极其致命)**：
+>    a. **符号库绑定**：在调用三剑客出图前，必须实例化并 `LoadSubGraph` 四大符号库（`FontSlib`, `LinStySlib`, `PatternSlib`, `SymBolSlib`），并通过 `map_disp.InitData(...)` 喂给画板，否则必报空指针崩溃！
+>    b. **窗口初始化**：直接传递 `Rct` 矩形必须使用 `map_disp.InitPartWindow2`，而不是 `InitPartWindow`。
+>    c. **原生图例支持**：Python SDK 完美支持原生图例，可调用 `prj_legend.DrawMapLegend(map_disp, Lt(x, y))`，无需强制剥离。
+>    d. **两段式 UI 叠加**：对于非原生 UI（如站点文字、特殊报警色块），绝不能用 QPainter，必须在 DMGIS 导出纯净底图 PNG 后，用 Python 自身的 `Pillow` 库读取并完成叠加。
+
+> **📌 [接口映射：后处理绘图 (drawbygraphics 替代方案)]**
+> * **禁止事项**：禁止在 Python 业务端调用 `IS_Create()` 获取图层去画图例和站点文字！
+> * **标准打法**：工程底图 (`PRJ_DrawPrj`) 生成 PNG 落盘后，使用 `PyQt5.QtGui.QImage` 重新加载该 PNG。利用原生的 `PyQt5.QtGui.QPainter` 结合封装好的 `LegendConfig` 字典，绘制图例色块、标题文字和站点要素（支持透明度、抗锯齿且无内存冲突），画完再次 `.save()` 覆盖原图。
+> 
+> 
+
+> **📌 [接口映射：投影系统 (MapProj)]**
+> * **C++ API 追踪**：`YSProjtojw = proj_init(&oldpara, &newpara);` -> `proj_Convxy`
+> * **Python 映射策略**：引入 `dmgis.mapproj.MapProj`。构建好 `Mpara` 实例后，直接 `proj = MapProj(old_mpara, new_mpara)`。转换点位必须使用封装的 `Dt(x, y)` 传入 `proj.Convxy(dt_in, dt_out)`。
+> 
+> 
+> **📌 [附录：DMGIS Python SDK 常用核心 API 字典 (已验证)]**
+> **以下所有类名、方法大小写及参数类型，均已在生产环境中绝对验证。
+> 
+> **【1. 投影与工程管理类】**
+> * **`DmPrj` (地图工程)**:
+>     * `OpenPrj(prj_path: str) -> bool`: 打开工程文件。
+>     * `GetLayerByLayName(layer_name: str) -> MapLayer`: 根据图层名获取图层。
+>     * `GetPrjRect(rect: Rct)`: 获取工程的物理矩形范围，直接修改传入的 rect。
+>     * `DrawPrj(disp: MapDisp)`: 绘制工程所有图层到底图。
+>     * `DrawLable(disp: MapDisp)`: 绘制工程的所有标注(Label)。
+>     * `PrjLegend() -> PrjLegend`: 获取工程原生图例对象。
+> * **`MapLayer` (图层)**:
+>     * `GetWork() -> AreaWork | PntWork | LineWork`: 获取图层绑定的工作区。
+>     * `SetLayerState(state: int)`: 设置图层显隐。1 为显示，0 为隐藏。
+>     * `GetRect(rect: Rct)`: 获取该图层的物理边界。
+> * **`PrjLegend` (原生图例)**:
+>     * `DrawMapLegend(disp: MapDisp, lt: Lt)`: 在画板的屏幕像素坐标(Lt)处绘制图例。
+> 
+> **【2. 内存工厂与工作区管理】**
+> * **`DtmWorkShop` (网格工厂)**:
+>     * `CreateGridWork() -> int`: 创建网格工作区，返回 ID。
+>     * `GetWorkByNo(id: int) -> GridWork`: 根据 ID 获取工作区对象。
+> * **`VecWorkShop` (矢量工厂)**:
+>     * `GetWorkByNo(id: int) -> AreaWork`: 获取矢量工作区。
+>     * `DelWorkByNo(id: int)`: 从内存中彻底释放该工作区。
+> * **`GridWork` (网格对象 - AnalyGrid / BaseGrid)**:
+>     * `OpenFile(path: str)`: 加载外部 .grid 文件。
+>     * `UpdateZMaxMin()`: 反向更新网格内存中的极值信息（极度重要，每次操作网格后必调）。
+>     * `GetGetGridInfo(info: GridDataInfo)`: 获取行列数和极值。
+>     * `SetEffective(part: Se_Part, invalid_val: float)`: 依据行政面设置有效区和白化值。
+>     * `GetValue(row: int, col: int) -> float`: 获取单个格点值。
+>     * `SetValue(row: int, col: int, val: float)`: 修改单个格点值。
+>     * `SaveWork(path: str)`: 落盘保存为 .grid。
+> * **`AreaWork` / `PntWork` (矢量对象)**:
+>     * `GetObjFNum() -> int`: 获取该工作区内的实体数量（物理数）
+>     * `GetObjNum() -> int`: 获取该工作区内的实体数量（逻辑数）
+>     * `DelObj(index: int)`: 删除指定索引的实体。
+>     * `GetObjPos(index: int, part: Se_Part)`: 提取指定面实体的多边形轮廓。
+>     * `GetWorkName() -> str`: 获取底层生成的临时名称。
+>     * `DownloadToFile(path: str)`: 另存工作区。注意 load 的 **l 是小写**！
+>     * `ReReadWork()`: 重新读取内存。
+> 
+> **【3. 空间插值与渲染引擎】**
+> * **`Tin` (三角网引擎)**:
+>     * `addpoint(x: float, y: float, val: float)`: 压入离散点。
+>     * `calculate4pintzvalue(rect: Rct)`: 计算四周控制点极值防溢出。
+>     * `dmmesh()`: 执行三角网构建。
+> * **`Grid` (网格分析与等值线追踪引擎)**:
+>     * `setgridwork(grid_work: GridWork)`: 绑定承载结果的网格。
+>     * `clearallcontour()`: 清除历史等值面内存。
+>     * `clearalltextcontour()`: 清除历史等值线文字。
+>     * `addcontour(tin: Tin, flag1: int, flag2: int)`: 将 Tin 结果压入网格。
+>     * `addcontour1(val: float, ainf: AInf)`: 添加指定阈值的等值面追踪任务及渲染属性。
+>     * `pushcontour()`: 推入管线。
+>     * `setsleek(level: int)`: 设置平滑度（如 5）。
+>     * `producecontourline(val1: int, val2: int)`: 生成等值线 (通常传 0, 0)。
+>     * `contourhandling()`: 处理线面拓扑。
+>     * `getareawork(path: str, vec_shop: VecWorkShop) -> int`: 导出面矢量，返回工作区 ID。
+> 
+> **【4. 渲染三剑客与显示管线】**
+> * **`Mapmsi` (画板)**: `CreateImg(w, h, bit)`, `SavePng(path)`。
+> * **`QPainterManager` (笔刷)**: `GetQPainterHandle(mapmsi.handle)`。
+> * **`MapDisp` (显示控制器)**:
+>     * `InitData(font, symbol, linsty, pattern)`: **必调！** 绑定四大符号库。
+>     * `InitPartWindow2(handle, x, y, w, h, rect: Rct)`: 初始化投影窗口（直接接收 Rct，不可用 InitPartWindow）。
+>     * `DrawFillRect(clr_val: clr, lclr: clr, rc: Rct, tflag: int)`: 画背景。
+> 
+> **【5. 关键结构体 (dmgis.common.dmsde)】**
+> * `Rct`: `.xmin`, `.xmax`, `.ymin`, `.ymax` (浮点数地理坐标)。
+> * `Dt`: `.x`, `.y` (浮点数地理坐标)。
+> * `Lt`: `.x`, `.y` (整型屏幕像素坐标)。
+> * `GridDataInfo`: `.rows`, `.cols`, `.zMax`, `.zMin`。
+> * `LInf` (注意大写 I): `.clr` (必须用 clr 包裹), `.lclass`, `.ltp`, `.xscale`, `.yscale`。
+> * `AInf`: `.col`, `.patclr`, `.patno`, `.linf` (挂载 LInf 对象)。
+
+【经验包收录尾】
+
+### 【DMGIS 雷达监控模型 Python 映射专属经验包】
+
+**📌 [核心机制一：雷达回波集合 (Rd_Obst) 的精准获取]**
+
+* **C++ 侧签名**:
+`LYR_GetRadarValSetAndPart(radarLayer, warnArea, radCfg.minStrength, radCfg.maxStrength, objs);`
+* **Python 侧映射**:
+```python
+from dmgis.common.Rd_Obst import Rd_Obst
+
+# 1. 实例化雷达对象容器 (无需手动释放)
+obs = Rd_Obst() 
+
+# 2. 调用图层级的方法，结合行政面 part 提取指定强度区间的回波
+radar_layer.GetRadarValSetAndPart(part, radCfg.minStrength, radCfg.maxStrength, obs)
+
+```
+
+**📌 [核心机制二：雷达回波对象的 Python 化遍历与解构]**
+
+* **C++ 侧签名**:
+`_RadobjVal objVal = obst->pobjects[i];`
+`objVal.x1, objVal.x2, ...`
+* **Python 侧映射**:
+结合 `5.19.2.py` 的证实，Python 端封装了极为友好的 `.toList()` 方法，可直接摒弃 C++ 中繁琐的指针数组遍历。
+```python
+# 1. 直接获取包含所有独立色斑(回波)的 Python 列表
+rad_obj_list = obs.toList()
+
+# 2. 遍历提取包围盒顶点与强度值 (直接映射 GetStringByRadObjs 的需求)
+str_result = ""
+for rad_obj in rad_obj_list:
+    # rad_obj 包含 x1, y1, x2, y2, x3, y3, x4, y4 以及 val (强度值)
+    str_result += f"{rad_obj.x1:.2f},{rad_obj.x2:.2f},{rad_obj.x3:.2f},{rad_obj.x4:.2f}*"
+
+```
+
+**📌 [核心机制三：基于 SpatialAnalysis 的空间缓冲区生成]**
+
+* **Python 侧专属扩展 (参考 5.22.1.py)**：
+如果业务中需要对面实体（如行政面）进行缓冲区外扩（如外扩 5km 监控周边雷达），必须使用 `SpatialAnalysis` 接口。
+```python
+from dmgis.analysis.SpatialAnalysis import SpatialAnalysis
+from dmgis.common.Se_Dtst import Se_Dtst
+
+# poly1 为提取出的原始单边形 Se_Dtst，poly2 为空容器
+poly2 = Se_Dtst()
+sa = SpatialAnalysis()
+
+# 生成 5000 米的缓冲区，结果回填至 poly2
+sa.createrngbuffer1(poly1, 5000, poly2)
+
+```
+
+【经验包收录尾】
+【中尺度实况 (SmallScale) DMGIS 映射经验补充】
+1. 内存格点文件写出映射
+
+C++ 业务代码：WDG_WriteFile(imgShiKuang.AnalyGrid(), strLocalTempRainGrid.toLocal8Bit().data());
+Python 转写指导：转写时直接提取格点工作对象并调用其面向对象方法，例如：gridwork.WriteFile(path)。
+
+2. 点面空间包含关系判定映射
+业务场景：在生成风速风向等产品时，需判断气象站点的坐标（经纬度）是否落在指定的行政区划多边形面（如玉林市边界）内，以剔除越界站点的无效渲染数据。
+C++ 原逻辑：dm_ptinpolygons1(&dmD, imgShiKuang.m_pPart)
+Python 映射规范：
+使用 SDK 封装好的 DmMapCom 公共类进行判定。必须先实例化 Dt (点) 和 Se_Part (多边形)。
+C++ 业务代码：dm_ptinpolygons1(&dmD, imgShiKuang.m_pPart)
+Python 转写指导：直接复用系统已有的公共工具。实例化 dmCom = DmMapCom()，将站点坐标装入 Dt() 对象，直接调用 dmCom.ptinpolygons1(dt, part) 进行判定（返回值 > 0 表示在行政区划内）。
+
+【经验包收录尾】
+
+### 📦 【DMGIS 乡镇预报及图层控制专栏经验包】
+
+**📌 [核心机制一：图层状态控制的“多态降维”与 Bug 避坑]**
+
+* **原 C++ 痛点**：在控制不同类型图层显隐时（如 `IsOn` 函数），原代码使用了巨型 `switch (LY_GetLayerType)` 来区分不同图层类型，并分别调用 `LYG_SetLayerState`, `LYM_SetLayerState` 等不同前缀的 DLL 接口。
+* **Python 侧映射（最佳实践）**：
+Python SDK 已通过面向对象的多态机制，在各图层子类内部绑定了相应的 C 接口。绝不应在 Python 中复刻 `switch` 逻辑。
+只需引入枚举：`from dmgis.common.DmEnumType import LayerStatus`，然后直接对图层实例调用统一方法即可。
+* **⚠️ 历史遗留 Bug 警示与 TODO 规范**：
+注意：当前版本的部分 Python SDK 胶水层存在参数强转 Bug（如 `MapLayer` 误用 `.encode('gbk')`，`NetLayer` 的 `to_bytes()` 缺参数）。
+**开发铁律**：假定 SDK 已修复，业务层代码直接按标准传数值。但**必须**在代码侧打上 `TODO` 注释以防万一。
+**标准代码范例**：
+```python
+# TODO: 留意 DMGIS Python SDK 针对 MapLayer 和 NetLayer 的底层参数转换 Bug。
+# 若运行时抛出 AttributeError (encode) 或 TypeError (to_bytes)，需联系 SDK 团队修复。
+# 隐藏图层
+layer.SetLayerState(LayerStatus.LAYDISP_HIDE.value) 
+# 显示图层
+layer.SetLayerState(LayerStatus.LAYDISP_DISP.value)
+
+```
+**📌 [核心机制二：DMGIS 图层类型全字典 (C++ Enum -> Python Class)]**
+为了让后续 AI 转写员在没有 C++ 原文对照的情况下，也能精准映射图层对象，特整理 DMGIS 全图层类型对照表。
+*特别注意：严禁望文生义，如 `LAYTYP_ARR` 对应的必须是 `GraphLayer`。*
+
+* **LAYTYP_MAP (1)** -> `MapLayer` (地理/地图图层 - 点/线/面/复合)
+* **LAYTYP_NET (2)** -> `NetLayer` (网络图层)
+* **LAYTYP_TXT (3)** -> `TextLayer` (文本图层)
+* **LAYTYP_IMG (4)** -> `ImageLayer` (影像图层)
+* **LAYTYP_WG (5)** -> `GridLayer` (网格图层)
+* **LAYTYP_RAD (6)** -> `RadLayer` (雷达/多普图层)
+* **LAYTYP_FLY (7)** -> `FlyLayer` (云图/风云图层)
+* **LAYTYP_WEA (8)** -> `WeatherLayer` (天气填图图层)
+* **LAYTYP_ARR (9)** -> `GraphLayer` (标绘图层 - **极易被误翻译为面状图层，切记！**)
+* **LAYTYP_DTM (10)** -> `DtmLayer` (DTM图层)
+* *(附加补充)* -> `TileLayer` (瓦片图层)
+
+**📌 [核心机制三：DmEnumType 三大图层核心枚举速查]**
+在 Python 侧，涉及图层操作时必须从 `dmgis.common.DmEnumType` 导入对应的系统枚举，严禁直接使用魔法数字（Magic Numbers）。
+
+1. **`LayerType` (图层类型枚举)**
+* 用途：用于判断或指定当前图层的数据性质。
+* 核心成员：`LAYTYP_MAP` (1), `LAYTYP_ARR` (9), `LAYTYP_DTM` (10) 等。
+
+2. **`LayerStatus` (图层状态枚举)**
+* 用途：控制图层在工作区中的可见性（最常用）。
+* 核心成员：
+* `LAYDISP_NULL` (-1)：工作区不在
+* `LAYDISP_HIDE` (0)：隐藏
+* `LAYDISP_DISP` (1)：可见
+
+3. **`LayerDispType` (图层显示方式枚举)**
+* 用途：控制特定图层（如等值线、色斑图）的渲染展现风格。
+* 核心成员：
+* `DISPSTY_OCE` (0)：默认统一
+* `DISPSTY_OLD` (1)：原始
+* `DISPSTY_DEG` (2)：分级显示（注意：网络层、影像层、文本层不支持此模式）
+
+【经验包收录尾】
+
+### 📌 [追加经验包：雷达拼图、独立渲染流与矢量构建核心映射]
+
+**📌 [核心机制一：独立渲染流的“三剑客”与内存释放铁律]**
+脱离高级基类（如 `imagegeneration`）进行纯底层 DMGIS 渲染（如雷达拼图出图）时，必须按特定顺序构建三大核心句柄，并在结束后**严格倒序释放**，否则必崩。
+
+* **创建与绑定顺序**：
+1. 图像句柄：`image = Mapmsi()` -> `image.CreateImg(wid, hei, 32)`
+2. 画笔管理器：`q_painter = QPainterManager()` -> `q_painter.GetQPainterHandle(image.handle)`
+3. 显示句柄：`mapDisp = MapDisp()` -> `mapDisp.InitPartWindow2(q_painter.handle, 0, 0, wid, hei, rct)`
+
+
+* **⚠️ 绝对铁律（销毁倒序）**：
+1. `mapDisp.delete()`
+2. `q_painter.DeleteQPainter()`
+3. `image.delete()`
+
+
+* **⚠️ 额外注意**：
+image.CreateImg(wid, hei, 32)这里第三个传参，传24对应JPG，传32对应PNG
+
+**📌 [核心机制二：显示句柄 (MapDisp) 绘图算子前缀映射]**
+原 C++ 中所有通过显示句柄 `DDHAND` 调用的以 `DD_` 开头的绘图接口，在 Python 端的 `MapDisp` 类中，**一律直接砍掉 `DD_` 前缀**，其余名称保持完全一致：
+
+* C++ `DD_DrawdText(...)` -> Python `mapDisp.DrawdText(...)`
+* C++ `DD_DrawdArea(...)` -> Python `mapDisp.DrawdArea(...)`
+* C++ `DD_DrawdLine(...)` -> Python `mapDisp.DrawdLine(...)`
+* C++ `DD_DrawLine1(...)` -> Python `mapDisp.DrawLine1(...)`
+* C++ `DD_DrawdLine(...)` -> Python `mapDisp.DrawdLine(...)`
+以此类推
+
+**📌 [核心机制三：雷达栅格数据的图层挂载]**
+原 C++ 代码：`LYR_SetRadFile(layer, path.toLocal8Bit().data(), 1)`
+Python 端图层对象（如 `RadLayer`）直接提供了同名挂载方法，底层引擎会自动处理矩阵，无需 Python 端介入栅格解析：
+
+* **Python 映射**: `layer.SetRadFile(file_path)`
+
+**📌 [核心机制四：矢量点集 (Se_Dtst) 与多边形部件 (Se_Part) 的构建与转换]**
+在 Python 端重构 C++ 的多边形或线条坐标逻辑时，保留了最原汁原味的底层构建方式。
+
+* **`Se_Dtst` 的构建**（支持两种方式，推荐依场景选择）：
+1. 列表直传法（Pythonic）：`dtst = Se_Dtst([Dt(x1, y1), Dt(x2, y2), ...])`
+2. 循环赋值法（传统）：`dtst = Se_Dtst(); dtst.setSize(5); dtst.setPos(0, Dt(x,y))`
+
+
+* **`Se_Dtst` 向 `Se_Part` 的转换（用于存入面工作区）**：
+必须借助 `toList()` 方法抽取 `Dt` 列表，再通过 `SetSize` 和 `SetPos` 压入 `Se_Part`。
+```python
+pts_list = out_dtst.toList()
+num_pts = len(pts_list)
+if num_pts >= 3:
+    part = Se_Part()
+    part.SetSize([num_pts])
+    for j in range(num_pts):
+        part.SetPos(j, pts_list[j])
+
+```
+
+**📌 [核心机制五：图层矢量对象的强制文本修改]**
+针对文本图层内部已有的对象，原 C++ 会获取其 `Work` 工作区句柄，并调用 `WVT_UpdateObjText`来替换工作区内指定实体（需要索引号）的文本内容
+
+* **Python 映射**:
+对应的 Python 工作区方法名为 `UpdateObjText`，业务层直接传 Python 字符串即可（底层已封装 GBK 转换）：
+`layer_work.UpdateObjText(index, text_str)`
+
+【经验包收录尾】
+
+### 📌 [追加经验包：QPF相关]
+
+**📌 [补充机制：标绘层 (GraphWork) 面实体叠加底层铁律]**
+
+与面矢量工作区 (VecWorkShop) 直接压入 `Se_Part` 的机制完全不同，标绘层必须严格保留 C++ 的“中间实体句柄”两步走逻辑，且必须引入专属的 `GraphCellObject` 实体封装类。
+
+* **新增全局导入**:
+
+```python
+from dmgis.work.GraphCellObject import GraphCellObject
+
+```
+【经验包收录尾】
+
+* **C++ 侧签名 (两步走)**:
+
+```cpp
+// 1. 创建实体句柄
+WHOHAND graphObject = WGO_CreateCellArea(dst, &inf); // dst 类型为 se_dtst 点集
+// 2. 压入工作区
+WG_AddObj(LYG_GetWork(signlay), graphObject);
+
+```
+
+* **Python 侧绝对映射**:
+
+```python
+# 1. 前置准备：构建好点集与属性 (严禁将 dtst 转为 Se_Part！)
+# dtst = Se_Dtst([...])
+# ainf = AInf(...)
+
+# 2. 实例化绘图实体对象
+cell_obj = GraphCellObject()
+
+# 3. 创建面实体并获取底层 C 指针句柄 (c_void_p)
+obj_handle = cell_obj.CreateCellArea(dtst, ainf)
+
+# 4. 将提取出的原生句柄直接压入标绘工作区
+graph_work.AddObj(obj_handle)
+
+```
+* **排坑标记 (Marker)**:
+在给 `GraphWork` 添加对象时，`AddObj` 的入参被极其严苛地限定为 `c_void_p`（底层 C 指针）。**绝对禁止**直接向 `graph_work.AddObj()` 传递 `Se_Dtst` 或 `Se_Part` 实例，否则必将引发 `TypeError` 或直接导致 DLL 调用崩溃。必须且只能通过 `GraphCellObject` 作为中介来生成并提取句柄！
+---
+
+【经验包收录尾】
+
+### 📌 [补充经验包：空间几何中间件 (Se_Dtst / Se_Part / Se_Dlist) 映射]
+
+**⚠️ 全局高危警告**：DMGIS Python SDK 在封装底层 C 结构时，这三个几何容器的方法命名存在严重的“大小写分裂”（例如 `Delete` 与 `delete`，`SetSize` 与 `setSize`）。在进行转写时，必须严格将其当做“字典”死记硬背，**绝对禁止瞎猜方法名的大小写或试图使用 `hasattr` 逃课**！
+
+#### 🟢 1. `Se_Dtst` (点集容器) 映射法则
+
+* **⚠️ 核心排坑 (`Adddt` 的真相)**：
+原 C++ 源码中频繁出现的 `se_dtstAdddt(dst, &dt)` **根本不是 DMGIS 官方底层接口**，而是原 C++ 开发者手搓的内存扩容补丁宏（位于 `se_util.h`）！
+在 Python 端，**绝对不存在** `Add` 或 `Adddt` 方法。请一律实施降维打击，直接使用 Python SDK 官方支持的优雅“列表直传法”进行初始化，底层会自动完成内存分配和赋值：
+* **标准写法 (强制推荐)**: `dst = Se_Dtst([Dt(x1, y1), Dt(x2, y2), ...])`
+
+
+* **底层方法严格映射 (注意小写字母 s 和大写字母 D)**:
+* C++ `se_dtstsetsize(dst, 5)` -> Python `dst.setSize(5)` *(首字母小写 s)*
+* C++ `se_dtstsetpos(...)` -> Python `dst.setPos(index, dt)` *(首字母小写 s)*
+* C++ `se_dtstgetsize(dst)` -> Python `dst.getSize()` *(首字母小写 g)*
+* C++ `se_dtstfree(dst)` -> Python `dst.Delete()` *(⚠️ 极其重要：首字母大写 D！)*
+
+
+
+#### 🟢 2. `Se_Part` (拓扑多边形/线段部件) 映射法则
+
+`Se_Part` 承载了带有拓扑结构的几何体，其 Python 端的方法封装采用了**大写驼峰**命名法，与 `Se_Dtst` 截然不同。
+
+* **解构与读取 (从网格追踪等值面后提取数据)**:
+* 提取部件总数 (C++ `dpart->nPartsCount`) -> Python `dpart.GetPartSize()` *(大写 G, P, S，返回整型)*
+* 提取指定单线段点集 (C++ `se_partgetdtst(dpart, k)`) -> Python `dpart.GetDtst(k)` *(大写 G, D，直接返回一个 `Se_Dtst` 对象)*
+
+
+* **构建与写入**:
+* 设置各环点数分布：`dpart.SetSize(parts: list[int])` *(大写 S，接收整数列表，如 `[4,3,3]`)*
+* 设置全局索引坐标：`dpart.SetPos(global_index, dt)` *(大写 S)*
+
+
+
+#### 🟢 3. `Se_Dlist` (双精度浮点链表) 映射法则
+
+常用于接收 `Grid` 网格中提取的等值线极值集合 `grd_getvalueset`。Python 端方法命名又切回了**小写驼峰**。
+
+* **底层方法严格映射**:
+* 获取链表长度 (C++ `valSet->num`) -> Python `valSet.getSize()` *(首字母小写 g)*
+* 根据索引取值 (C++ `se_dlistgetpos(valSet, i)`) -> Python `valSet.getPos(i)` *(首字母小写 g，返回 float)*
+* 释放内存 (C++ `se_dlistfree(valSet)`) -> Python `valSet.delete()` *(⚠️ 极其重要：首字母小写 d！与 Se_Dtst 的大写 D 完全不同！)*
+* 列表直传初始化：支持 `valSet = Se_Dlist([1.1, 2.2, 3.3])`
+
+【经验包收录尾】
+
+> **📌 [补充接口映射：网格分析引擎数据清理]**
+> * **C++ API 追踪**：`grd_cleardata(gridAnaly)`
+> * **Python 映射策略**：`grid_analy.cleardata()`
+> * **排坑标记 (Marker)**：在复用同一个 `Grid` 引擎实例（如 `gridAnaly = Grid()`）进行多时次、多要素的循环网格解析时，在每次挂载（`setgridwork`）新的物理网格前，必须调用 `cleardata()` 清空上一轮内部缓存的数据矩阵，否则极易导致不同气象要素的数据串图或极值重叠污染。
