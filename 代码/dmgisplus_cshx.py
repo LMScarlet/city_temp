@@ -382,6 +382,24 @@ class CShxAnalysis:
         except Exception:
             return "5级"
 
+    def get_weight(self, val, element_name, yzList):
+        """
+        获取气象因子对应的权重分。具备断层自适应就近吸附能力。
+        """
+        # 筛选出当前因子的所有规则
+        rules = [yz for yz in yzList if yz["element"] == element_name]
+        if not rules:
+            return 0.0  # 没配置规则，安全兜底为 0 分
+
+        # 1. 尝试精确匹配（落在正常区间内）
+        for yz in rules:
+            if yz["min"] <= val <= yz["max"]:
+                return yz["yz"]
+
+        # 2. 如果没命中（落在了缝隙里，如 70.9），寻找边界最接近的规则进行吸附
+        closest_rule = min(rules, key=lambda yz: min(abs(val - yz["min"]), abs(val - yz["max"])))
+        return closest_rule["yz"]
+
     def cshxAnlysis(self, date_str: str, sc: str, codename: str) -> bool:
         """城市火险核心分析逻辑"""
         gridpath = os.path.join(self.basepath, "result", f"{codename}.grid")
@@ -408,7 +426,7 @@ class CShxAnalysis:
                 "max(COALESCE(CAST(NULLIF(TRIM(CAST(winds AS text)), '') AS numeric), 0)) as winds",
                 "sum(COALESCE(CAST(NULLIF(TRIM(CAST(rain AS text)), '') AS numeric), 0)) as rain"
             ]
-            param_fcst = f"dateChar='{date_str}' and timechar='{sc}' and ntimes<=24 "
+            param_fcst = f"dateChar like '{date_str}%' and timechar='{sc}' and ntimes<=24 "
             fcst_data = DataServiceOperate.http_request_post(self.myDB.qx_url, "township_forecast",
                                                              "select", param_fcst, columns=cols_fcst)
 
@@ -448,7 +466,7 @@ class CShxAnalysis:
                     })
 
             # 3. 计算特殊站点的预报 tour_fcst 和实况 tour_smallscale
-            param_tour = f"dateChar='{date_str}' and timechar='{sc}' and ntimes<= 24  and forecasttype = 12"
+            param_tour = f"dateChar like '{date_str}%' and timechar='{sc}' and ntimes<= 24  and forecasttype = 12"
             tour_data = DataServiceOperate.http_request_post(self.myDB.fw_url, "tour_fcst", "select", param_tour,
                                                              advcode=self.myDB.dm_advcode, columns=cols_fcst)
 
@@ -524,22 +542,38 @@ class CShxAnalysis:
                 valRain = city["ybRain"]
                 valno = city["noRainDay"]
 
-                # 应用权重
-                for yz in yzList:
-                    if yz["element"] == "日最高气温" and yz["min"] <= valtemp <= yz["max"]:
-                        city["ybMaxTemp"] = yz["yz"]
-                    elif yz["element"] == "日最小相对湿度" and yz["min"] <= valrel <= yz["max"]:
-                        city["ybMinRelHumidity"] = yz["yz"]
-                    elif yz["element"] == "日最大风速" and yz["min"] <= valwind <= yz["max"]:
-                        city["ybMaxWindS"] = yz["yz"]
-                    elif yz["element"] == "连续无降水日数" and yz["min"] <= valno <= yz["max"]:
-                        city["noRainDay"] = yz["yz"]
-                    elif yz["element"] == "日降水量" and yz["min"] <= valRain <= yz["max"]:
-                        city["ybRain"] = yz["yz"]
+                # # 应用权重
+                # for yz in yzList:
+                #     if yz["element"] == "日最高气温" and yz["min"] <= valtemp <= yz["max"]:
+                #         city["ybMaxTemp"] = yz["yz"]
+                #     elif yz["element"] == "日最小相对湿度" and yz["min"] <= valrel <= yz["max"]:
+                #         city["ybMinRelHumidity"] = yz["yz"]
+                #     elif yz["element"] == "日最大风速" and yz["min"] <= valwind <= yz["max"]:
+                #         city["ybMaxWindS"] = yz["yz"]
+                #     elif yz["element"] == "连续无降水日数" and yz["min"] <= valno <= yz["max"]:
+                #         city["noRainDay"] = yz["yz"]
+                #     elif yz["element"] == "日降水量" and yz["min"] <= valRain <= yz["max"]:
+                #         city["ybRain"] = yz["yz"]
 
+                # 提取原始气象值
+                valrel = city["ybMinRelHumidity"]
+                valtemp = city["ybMaxTemp"]
+                valwind = city["ybMaxWindS"]
+                valRain = city["ybRain"]
+                valno = city["noRainDay"]
+
+                # 独立获取权重并覆盖
+                city["ybMaxTemp"] = self.get_weight(valtemp, "日最高气温", yzList)
+                city["ybMinRelHumidity"] = self.get_weight(valrel, "日最小相对湿度", yzList)
+                city["ybMaxWindS"] = self.get_weight(valwind, "日最大风速", yzList)
+                city["noRainDay"] = self.get_weight(valno, "连续无降水日数", yzList)
+                city["ybRain"] = self.get_weight(valRain, "日降水量", yzList)
+
+                # 计算总分
                 sumYz = int(
                     city["ybMaxTemp"] + city["ybMinRelHumidity"] + city["ybMaxWindS"] + city["noRainDay"] + city[
                         "ybRain"])
+
                 firelevel = self.getFireLevel(sumYz)
 
                 insert_data = {
@@ -776,7 +810,7 @@ if __name__ == "__main__":
         test_json = {
             "className": "model",
             "methodName": "cshx",
-            "postdata": "gxyulin|2026-06-11 08:00:00|08"
+            "postdata": "gxyulin1|2026-06-11 08:00:00|08"
         }
         result = runService(
             className=test_json["className"],
